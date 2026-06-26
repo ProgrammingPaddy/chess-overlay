@@ -29,6 +29,7 @@ class Config:
     board_monitor: int = 0
     white_bottom: bool = True
     show_arrows: bool = True
+    gold_moves: bool = True           # highlight a clearly-best / forced-mate move in gold
     allow_illegal: bool = False      # accept recognized positions even if not a legal move
     show_predicted: bool = True      # show the opponent's best move (red) on their turn
     pause_on_drag: bool = True       # freeze the eval while a piece is held on the board

@@ -39,8 +39,10 @@ WDA_EXCLUDEFROMCAPTURE = 0x11   # window is visible to the user but not to scree
 GREEN = (40, 200, 80)
 GREY = (150, 150, 150)
 RED = (225, 60, 60)
-FAINT_ALPHA = 70           # opacity of the weakest / a clustered move (still visible)
-SPREAD_FULL_CP = 10.0      # eval spread (cp) among the shown moves at which contrast is full
+GOLD = (255, 195, 30)      # a standout (>=1 pawn clear) or a forced-mate move
+FAINT_ALPHA = 45           # opacity of the weakest / a clustered move (still visible)
+SPREAD_FULL_CP = 7.0       # eval spread (cp) among the shown moves at which contrast is full
+GOLD_LEAD_CP = 100.0       # a non-mate move this many cp clear of the rest goes gold
 
 
 def _advantage(ann: "Annotation") -> float:
@@ -73,14 +75,35 @@ def _relative_strengths(suggestions) -> list[float]:
     return [((v - lo) / spread) * weight for v in vals]
 
 
+def _gold_strengths(suggestions) -> dict:
+    """Indices -> gold opacity (0..1). A move is GOLD when it is a forced mate FOR
+    the player (fastest mate full, longer mates fainter) or — absent a mate — a
+    single move at least ~1 pawn clear of every other shown move."""
+    mates = [(i, s.mate_in) for i, s in enumerate(suggestions)
+             if s.mate_in is not None and s.mate_in > 0]
+    if mates:
+        fastest = min(m for _, m in mates)
+        return {i: fastest / m for i, m in mates}
+    vals = [_player_value(s) for s in suggestions]
+    if len(vals) >= 2:
+        order = sorted(range(len(vals)), key=lambda i: -vals[i])
+        if vals[order[0]] - vals[order[1]] >= GOLD_LEAD_CP:
+            return {order[0]: 1.0}
+    return {}
+
+
 def _arrow_color(ann: "Annotation") -> QtGui.QColor:
     if ann.opponent:
         return QtGui.QColor(*RED, 235)
     alpha = int(round(FAINT_ALPHA + (255 - FAINT_ALPHA) * max(0.0, min(1.0, ann.strength))))
+    if ann.gold:
+        return QtGui.QColor(*GOLD, alpha)
     return QtGui.QColor(*(GREEN if _advantage(ann) >= 0 else GREY), alpha)
 
 
 def _eval_text_color(ann: "Annotation") -> QtGui.QColor:
+    if ann.gold:
+        return QtGui.QColor(255, 220, 90)
     return QtGui.QColor(255, 95, 95) if _advantage(ann) < 0 else QtGui.QColor(120, 240, 150)
 
 
@@ -114,13 +137,15 @@ class Annotation:
     score_cp: int | None = None    # ABSOLUTE centipawns (+ White, - Black) -> colour
     mate: int | None = None        # ABSOLUTE mate distance (+ White mates, - Black mates)
     strength: float = 1.0          # 0..1 relative standout among shown moves -> opacity
+    gold: bool = False             # standout (>=1 pawn clear) or forced-mate move
 
 
 def build_annotations(suggestions, opp_move=None, show_opponent=True,
-                      white_to_move=True) -> list["Annotation"]:
+                      white_to_move=True, gold_enabled=True) -> list["Annotation"]:
     """Turn engine output into arrows under the fixed tempo model:
 
-      * the player's moves — GREEN when the resulting position favours White, GREY
+      * the player's moves — GOLD when a move is a forced mate or clearly best
+        (>= ~1 pawn), else GREEN when the resulting position favours White / GREY
         when it favours Black; opacity is RELATIVE to the other shown moves; the
         eval number is ABSOLUTE (+ White, - Black);
       * RED — the opponent's single predicted best move (only when looking ahead).
@@ -130,13 +155,16 @@ def build_annotations(suggestions, opp_move=None, show_opponent=True,
     anns: list[Annotation] = []
     if opp_move is not None and show_opponent:
         anns.append(Annotation(move=opp_move, rank=1, opponent=True))
+    strengths = _relative_strengths(suggestions)
+    golds = _gold_strengths(suggestions) if gold_enabled else {}
     flip = not white_to_move
-    for s, strength in zip(suggestions, _relative_strengths(suggestions)):
+    for i, s in enumerate(suggestions):
         abs_cp = (-s.score_cp if (flip and s.score_cp is not None) else s.score_cp)
         abs_mate = (-s.mate_in if (flip and s.mate_in is not None) else s.mate_in)
+        is_gold = i in golds
         anns.append(Annotation(move=s.move, rank=s.rank, opponent=False,
-                               label=s.eval_text_pov(flip), score_cp=abs_cp,
-                               mate=abs_mate, strength=strength))
+                               label=s.eval_text_pov(flip), score_cp=abs_cp, mate=abs_mate,
+                               strength=(golds[i] if is_gold else strengths[i]), gold=is_gold))
     return anns
 
 

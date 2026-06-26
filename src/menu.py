@@ -170,9 +170,12 @@ class MenuWindow(QtWidgets.QWidget):
         bf.addRow(self.board_status)
         self.show_arrows_cb = QtWidgets.QCheckBox("Show arrows on board")
         self.show_arrows_cb.setChecked(self.cfg.show_arrows)
+        self.gold_moves_cb = QtWidgets.QCheckBox("Highlight a clearly-best / mate move in gold")
+        self.gold_moves_cb.setChecked(self.cfg.gold_moves)
         self.white_bottom_cb = QtWidgets.QCheckBox("White on bottom")
         self.white_bottom_cb.setChecked(self.cfg.white_bottom)
         bf.addRow(self.show_arrows_cb)
+        bf.addRow(self.gold_moves_cb)
         bf.addRow(self.white_bottom_cb)
         v.addWidget(board)
 
@@ -285,7 +288,7 @@ class MenuWindow(QtWidgets.QWidget):
         self.track_cb.toggled.connect(self._on_track_toggled)
         self.reset_game_btn.clicked.connect(self._on_reset_game)
         self.flip_turn_btn.clicked.connect(self._on_flip_turn)
-        for wdg in (self.show_arrows_cb, self.white_bottom_cb,
+        for wdg in (self.show_arrows_cb, self.gold_moves_cb, self.white_bottom_cb,
                     self.allow_illegal_cb, self.predict_cb, self.pause_drag_cb):
             wdg.toggled.connect(self._on_settings_changed)
         for cb in (self.monitor_combo, self.mode_combo, self.side_combo):
@@ -388,7 +391,7 @@ class MenuWindow(QtWidgets.QWidget):
                     san = s.uci
                 self.results_list.addItem(f"#{s.rank}  {san:7s} {s.eval_text_pov(flip)}")
             self._suggestions = build_annotations(suggestions, opp_move, self.cfg.show_predicted,
-                                                  board.turn == chess.WHITE)
+                                                  board.turn == chess.WHITE, self.cfg.gold_moves)
             self._draw_arrows()
             if opp_move is not None:
                 try:
@@ -416,6 +419,7 @@ class MenuWindow(QtWidgets.QWidget):
         self.cfg.analyze_for = self.side_combo.currentData()
         self.cfg.board_monitor = self._monitor_index()
         self.cfg.show_arrows = self.show_arrows_cb.isChecked()
+        self.cfg.gold_moves = self.gold_moves_cb.isChecked()
         self.cfg.white_bottom = self.white_bottom_cb.isChecked()
         self.cfg.allow_illegal = self.allow_illegal_cb.isChecked()
         self.cfg.show_predicted = self.predict_cb.isChecked()
