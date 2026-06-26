@@ -21,11 +21,11 @@ from src.engine import MoveSuggestion
 
 
 class EngineController(QtCore.QThread):
-    # (suggestions, depth, analysed Board, opponent_move | None, request token)
+    # (player suggestions, depth, analysed Board, opponent suggestions list, token)
     updated = QtCore.Signal(list, int, object, object, int)
     failed = QtCore.Signal(str)
     ready = QtCore.Signal()
-    LOOKAHEAD_DEPTH = 14   # depth for guessing the opponent's best move
+    LOOKAHEAD_DEPTH = 12   # depth for the opponent's candidate moves (kept shallow for speed)
 
     def __init__(self, engine_path: str, threads: int, hash_mb: int, parent=None):
         super().__init__(parent)
@@ -116,34 +116,45 @@ class EngineController(QtCore.QThread):
                 pass
             self._engine = None
 
+    def _top_moves(self, board: chess.Board, multipv: int, depth: int) -> list:
+        """One-shot multipv analysis -> ranked MoveSuggestions (opponent's reds)."""
+        try:
+            infos = self._engine.analyse(board, chess.engine.Limit(depth=depth), multipv=multipv)
+        except Exception:
+            return []
+        if isinstance(infos, dict):
+            infos = [infos]
+        out = []
+        for rank, info in enumerate(infos, start=1):
+            s = MoveSuggestion.from_info(info, board, rank)
+            if s:
+                out.append(s)
+        return out
+
     def _analyze(self, board: chess.Board, multipv: int, mode: str, depth: int,
                  player_color: bool | None = None, token: int = 0) -> None:
         # Tempo model:
         #   * player to move  -> analyse the CURRENT position for the player.
-        #   * opponent to move -> take the opponent's rank-1 move, play it, and
-        #     analyse the PLAYER's responses ("what I should be ready to play
-        #     after their best move"). The opponent's move is reported as opp_move.
-        opp_move, target_board = None, board
-        looking = (player_color is not None and board.is_valid()
-                   and board.turn != player_color and board.legal_moves.count() > 0)
-        if looking:
-            try:
-                info = self._engine.analyse(board, chess.engine.Limit(depth=self.LOOKAHEAD_DEPTH))
-                pv = info.get("pv")
-                if pv:
-                    opp_move = pv[0]
-                    target_board = board.copy()
-                    target_board.push(opp_move)
-            except Exception:
-                opp_move, target_board = None, board
-
-        # If the opponent's best move ends the game, there are no player responses
-        # — still surface the predicted move (red) so it is visible.
-        if opp_move is not None and target_board.legal_moves.count() == 0:
-            self.updated.emit([], 0, target_board, opp_move, token)
+        #   * opponent to move -> get the opponent's top candidate moves (reds),
+        #     play their best, and analyse the PLAYER's responses to it (greens).
+        # Game over (no legal moves) -> emit an empty result so the UI shows the
+        # result cleanly instead of going silent on an unsearchable position.
+        if board.legal_moves.count() == 0:
+            self.updated.emit([], 0, board, [], token)
             return
 
-        n = min(multipv, max(1, target_board.legal_moves.count()))
+        opp_suggestions, target_board = [], board
+        if player_color is not None and board.is_valid() and board.turn != player_color:
+            opp_suggestions = self._top_moves(board, multipv, self.LOOKAHEAD_DEPTH)
+            if opp_suggestions:
+                target_board = board.copy()
+                target_board.push(opp_suggestions[0].move)
+
+        if target_board.legal_moves.count() == 0:        # opponent's best move ends the game
+            self.updated.emit([], 0, target_board, opp_suggestions, token)
+            return
+
+        n = min(multipv, target_board.legal_moves.count())
         limit = chess.engine.Limit(depth=depth) if mode == "fixed" else None
         latest: dict[int, dict] = {}
         last_emit = -1
@@ -158,18 +169,18 @@ class EngineController(QtCore.QThread):
                     coherent = min(int(v.get("depth", 0)) for v in latest.values())
                     if coherent > last_emit:
                         last_emit = coherent
-                        self._emit(latest, coherent, target_board, opp_move, token)
+                        self._emit(latest, coherent, target_board, opp_suggestions, token)
             if not (self._wake.is_set() or self._shutdown) and len(latest) >= n:
                 coherent = min(int(v.get("depth", 0)) for v in latest.values())
                 if coherent != last_emit:
-                    self._emit(latest, coherent, target_board, opp_move, token)
+                    self._emit(latest, coherent, target_board, opp_suggestions, token)
         self._analysis = None
 
-    def _emit(self, latest, depth, board, opp_move, token) -> None:
+    def _emit(self, latest, depth, board, opp_suggestions, token) -> None:
         out = []
         for rank, key in enumerate(sorted(latest), start=1):
             s = MoveSuggestion.from_info(latest[key], board, rank)
             if s:
                 out.append(s)
         if out:
-            self.updated.emit(out, depth, board, opp_move, token)
+            self.updated.emit(out, depth, board, opp_suggestions, token)

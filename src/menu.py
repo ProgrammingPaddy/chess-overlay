@@ -243,7 +243,7 @@ class MenuWindow(QtWidgets.QWidget):
         top.addRow("I play as", self.side_combo)
         self.track_cb = QtWidgets.QCheckBox("Auto-track game")
         top.addRow(self.track_cb)
-        self.predict_cb = QtWidgets.QCheckBox("Show opponent's best move (red) on their turn")
+        self.predict_cb = QtWidgets.QCheckBox("Show opponent's likely moves (red) on their turn")
         self.predict_cb.setChecked(self.cfg.show_predicted)
         top.addRow(self.predict_cb)
         self.pause_drag_cb = QtWidgets.QCheckBox("Pause eval while dragging a piece")
@@ -386,7 +386,7 @@ class MenuWindow(QtWidgets.QWidget):
 
     # ---------------------------------------------------------------- slots
     def _on_analysis_updated(self, suggestions: list, depth: int, board: chess.Board,
-                             opp_move, token: int) -> None:
+                             opp_suggestions: list, token: int) -> None:
         if token != self._req_id:        # stale emit from a superseded request
             return
         try:
@@ -398,20 +398,37 @@ class MenuWindow(QtWidgets.QWidget):
                 except Exception:
                     san = s.uci
                 self.results_list.addItem(f"#{s.rank}  {san:7s} {s.eval_text_pov(flip)}")
-            self._suggestions = build_annotations(suggestions, opp_move, self.cfg.show_predicted,
+            self._suggestions = build_annotations(suggestions, opp_suggestions, self.cfg.show_predicted,
                                                   board.turn == chess.WHITE, self.cfg.gold_moves)
             self._draw_arrows()
-            if opp_move is not None:
-                try:
-                    opp_san = self.tracker.board.san(opp_move)
-                except Exception:
-                    opp_san = opp_move.uci()
-                note = f"  (prep vs their best: {opp_san})"
+            if not suggestions:
+                self.status_label.setText(self._terminal_status(board, opp_suggestions))
             else:
                 note = ""
-            self.status_label.setText(f"Depth {depth}, {len(suggestions)} line(s).{note}")
+                if opp_suggestions:
+                    try:
+                        opp_san = self.tracker.board.san(opp_suggestions[0].move)
+                    except Exception:
+                        opp_san = opp_suggestions[0].move.uci()
+                    note = f"  (prep vs their best: {opp_san})"
+                self.status_label.setText(f"Depth {depth}, {len(suggestions)} line(s).{note}")
         except Exception as exc:
             self.status_label.setText(f"render error: {exc}")
+
+    @staticmethod
+    def _terminal_status(board: chess.Board, opp_suggestions: list) -> str:
+        """Status when there are no player moves to show — a real game over vs a
+        predicted opponent finish (so the engine never just goes silent)."""
+        if opp_suggestions:                     # look-ahead: their best move ends it
+            mv = opp_suggestions[0].move.uci()
+            return f"Opponent's {mv} would finish the game."
+        if board.is_checkmate():
+            return f"Checkmate — {'Black' if board.turn else 'White'} wins."
+        if board.is_stalemate():
+            return "Stalemate — draw."
+        if board.is_game_over(claim_draw=True):
+            return f"Game over — {board.result(claim_draw=True)}."
+        return "No analysis (position not searchable)."
 
     def _on_analysis_failed(self, message: str) -> None:
         self.status_label.setText(f"Engine recovered after error: {message}")

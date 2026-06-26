@@ -39,7 +39,8 @@ WDA_EXCLUDEFROMCAPTURE = 0x11   # window is visible to the user but not to scree
 GREEN = (40, 200, 80)
 GREY = (150, 150, 150)
 RED = (225, 60, 60)
-GOLD = (255, 195, 30)      # a standout (>=1 pawn clear) or a forced-mate move
+DARK_RED = (120, 0, 12)    # opponent's dominant move (>=1 pawn / mate) — red analog of gold
+GOLD = (255, 195, 30)      # the player's standout (>=1 pawn clear) or forced-mate move
 FAINT_ALPHA = 45           # opacity of the weakest / a clustered move (still visible)
 SPREAD_FULL_CP = 7.0       # eval spread (cp) among the shown moves at which contrast is full
 GOLD_LEAD_CP = 100.0       # a non-mate move this many cp clear of the rest goes gold
@@ -93,15 +94,19 @@ def _gold_strengths(suggestions) -> dict:
 
 
 def _arrow_color(ann: "Annotation") -> QtGui.QColor:
-    if ann.opponent:
-        return QtGui.QColor(*RED, 235)
     alpha = int(round(FAINT_ALPHA + (255 - FAINT_ALPHA) * max(0.0, min(1.0, ann.strength))))
-    if ann.gold:
+    if ann.opponent:                          # opponent's likely moves, in red
+        if ann.gold:                          # an overwhelmingly strong reply -> very dark red
+            return QtGui.QColor(*DARK_RED, max(alpha, 230))
+        return QtGui.QColor(*RED, alpha)
+    if ann.gold:                              # the player's standout / mate -> gold
         return QtGui.QColor(*GOLD, alpha)
     return QtGui.QColor(*(GREEN if _advantage(ann) >= 0 else GREY), alpha)
 
 
 def _eval_text_color(ann: "Annotation") -> QtGui.QColor:
+    if ann.opponent:
+        return QtGui.QColor(255, 70, 70) if ann.gold else QtGui.QColor(255, 140, 140)
     if ann.gold:
         return QtGui.QColor(255, 220, 90)
     return QtGui.QColor(255, 95, 95) if _advantage(ann) < 0 else QtGui.QColor(120, 240, 150)
@@ -140,31 +145,38 @@ class Annotation:
     gold: bool = False             # standout (>=1 pawn clear) or forced-mate move
 
 
-def build_annotations(suggestions, opp_move=None, show_opponent=True,
-                      white_to_move=True, gold_enabled=True) -> list["Annotation"]:
-    """Turn engine output into arrows under the fixed tempo model:
-
-      * the player's moves — GOLD when a move is a forced mate or clearly best
-        (>= ~1 pawn), else GREEN when the resulting position favours White / GREY
-        when it favours Black; opacity is RELATIVE to the other shown moves; the
-        eval number is ABSOLUTE (+ White, - Black);
-      * RED — the opponent's single predicted best move (only when looking ahead).
-
-    ``suggestions`` are ``MoveSuggestion`` with player-POV scores; ``white_to_move``
-    is the analysed board's side to move, used to flip those scores to absolute."""
-    anns: list[Annotation] = []
-    if opp_move is not None and show_opponent:
-        anns.append(Annotation(move=opp_move, rank=1, opponent=True))
+def _styled_set(suggestions, opponent: bool, flip: bool, gold: bool) -> list["Annotation"]:
+    """Annotations for one side: relative opacity within the set + a dominant flag,
+    eval shown ABSOLUTE (+ White, - Black). ``flip`` negates the side-to-move score."""
     strengths = _relative_strengths(suggestions)
-    golds = _gold_strengths(suggestions) if gold_enabled else {}
-    flip = not white_to_move
+    golds = _gold_strengths(suggestions) if gold else {}
+    out = []
     for i, s in enumerate(suggestions):
         abs_cp = (-s.score_cp if (flip and s.score_cp is not None) else s.score_cp)
         abs_mate = (-s.mate_in if (flip and s.mate_in is not None) else s.mate_in)
-        is_gold = i in golds
-        anns.append(Annotation(move=s.move, rank=s.rank, opponent=False,
-                               label=s.eval_text_pov(flip), score_cp=abs_cp, mate=abs_mate,
-                               strength=(golds[i] if is_gold else strengths[i]), gold=is_gold))
+        dom = i in golds
+        out.append(Annotation(move=s.move, rank=s.rank, opponent=opponent,
+                              label=s.eval_text_pov(flip), score_cp=abs_cp, mate=abs_mate,
+                              strength=(golds[i] if dom else strengths[i]), gold=dom))
+    return out
+
+
+def build_annotations(suggestions, opp_suggestions=None, show_opponent=True,
+                      white_to_move=True, gold_enabled=True) -> list["Annotation"]:
+    """Turn engine output into arrows under the fixed tempo model:
+
+      * the player's moves — GOLD when a forced mate or clearly best (>= ~1 pawn),
+        else GREEN (resulting position favours White) / GREY (favours Black);
+      * the opponent's likely moves (look-ahead only) — the SAME rules in RED, with
+        an overwhelmingly strong reply in very dark red.
+
+    Opacity is RELATIVE within each side; eval numbers are ABSOLUTE (+ White,
+    - Black). ``white_to_move`` is the player-position's side to move; the opponent
+    moved one ply earlier, so their scores flip the opposite way."""
+    anns: list[Annotation] = []
+    if opp_suggestions and show_opponent:
+        anns += _styled_set(opp_suggestions, opponent=True, flip=white_to_move, gold=gold_enabled)
+    anns += _styled_set(suggestions, opponent=False, flip=not white_to_move, gold=gold_enabled)
     return anns
 
 
