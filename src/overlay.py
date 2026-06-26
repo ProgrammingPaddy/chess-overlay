@@ -31,18 +31,57 @@ import win32gui
 
 WDA_EXCLUDEFROMCAPTURE = 0x11   # window is visible to the user but not to screen capture
 
-# Player moves in green, opponent (predicted) moves in red. Within each family
-# the strongest move is the most opaque/visible; all three stay readable.
-GREEN_SHADES = [
-    QtGui.QColor(40, 200, 80, 255),
-    QtGui.QColor(70, 205, 105, 190),
-    QtGui.QColor(105, 215, 135, 140),
-]
-RED_SHADES = [
-    QtGui.QColor(225, 55, 55, 255),
-    QtGui.QColor(230, 95, 95, 190),
-    QtGui.QColor(235, 135, 135, 140),
-]
+# Arrow style encodes the eval (player POV). A move that keeps/gives an advantage
+# is GREEN, fading from faint near 0.00 to rich and opaque as it gets better; a
+# move whose best outcome still leaves the player worse off is GREY. The
+# opponent's predicted move is solid RED. The eval number is green when >= 0 and
+# red when < 0.
+GREEN = (40, 200, 80)
+GREY = (150, 150, 150)
+RED = (225, 60, 60)
+FAINT_ALPHA = 70           # opacity of the weakest / a clustered move (still visible)
+SPREAD_FULL_CP = 10.0      # eval spread (cp) among the shown moves at which contrast is full
+
+
+def _advantage(ann: "Annotation") -> float:
+    """ABSOLUTE advantage in pawns (+ White better, - Black better); mate clamps large."""
+    if ann.mate is not None:
+        return 99.0 if ann.mate > 0 else -99.0
+    return (ann.score_cp / 100.0) if ann.score_cp is not None else 0.0
+
+
+def _player_value(s) -> float:
+    """Player-POV value (higher = better for the player) used to rank the moves."""
+    if s.mate_in is not None:
+        return 1e5 if s.mate_in > 0 else -1e5
+    return float(s.score_cp) if s.score_cp is not None else 0.0
+
+
+def _relative_strengths(suggestions) -> list[float]:
+    """0..1 per move — how much it stands out from the others. A tight pack of
+    near-equal moves stays near 0 (faint); a clear breakout reaches ~1 (bright)."""
+    if not suggestions:
+        return []
+    if len(suggestions) == 1:
+        return [1.0]
+    vals = [_player_value(s) for s in suggestions]
+    lo, hi = min(vals), max(vals)
+    spread = hi - lo
+    if spread < 1e-6:
+        return [0.0] * len(suggestions)
+    weight = min(1.0, spread / SPREAD_FULL_CP)
+    return [((v - lo) / spread) * weight for v in vals]
+
+
+def _arrow_color(ann: "Annotation") -> QtGui.QColor:
+    if ann.opponent:
+        return QtGui.QColor(*RED, 235)
+    alpha = int(round(FAINT_ALPHA + (255 - FAINT_ALPHA) * max(0.0, min(1.0, ann.strength))))
+    return QtGui.QColor(*(GREEN if _advantage(ann) >= 0 else GREY), alpha)
+
+
+def _eval_text_color(ann: "Annotation") -> QtGui.QColor:
+    return QtGui.QColor(255, 95, 95) if _advantage(ann) < 0 else QtGui.QColor(120, 240, 150)
 
 
 @dataclass
@@ -71,25 +110,33 @@ class Annotation:
     move: chess.Move
     rank: int = 1
     label: str = ""        # optional text near the destination (e.g. the eval)
-    opponent: bool = False  # True => draw red (predicted opponent move), else green
+    opponent: bool = False  # True => draw red (predicted opponent move)
+    score_cp: int | None = None    # ABSOLUTE centipawns (+ White, - Black) -> colour
+    mate: int | None = None        # ABSOLUTE mate distance (+ White mates, - Black mates)
+    strength: float = 1.0          # 0..1 relative standout among shown moves -> opacity
 
 
-def build_annotations(suggestions, opp_move=None, show_opponent=True) -> list["Annotation"]:
+def build_annotations(suggestions, opp_move=None, show_opponent=True,
+                      white_to_move=True) -> list["Annotation"]:
     """Turn engine output into arrows under the fixed tempo model:
 
-      * GREEN = the player's moves (always the analysed side, so eval labels are
-        already from the player's point of view).
-      * RED  = the opponent's single predicted best move, present ONLY when we
-        looked ahead (it is the opponent's turn). One red arrow, never a fan of
-        them — the move the green prep assumes.
+      * the player's moves — GREEN when the resulting position favours White, GREY
+        when it favours Black; opacity is RELATIVE to the other shown moves; the
+        eval number is ABSOLUTE (+ White, - Black);
+      * RED — the opponent's single predicted best move (only when looking ahead).
 
-    ``suggestions`` are ``MoveSuggestion``; ``opp_move`` is a ``chess.Move`` or
-    ``None`` (None => it is the player's turn, no look-ahead, no red)."""
+    ``suggestions`` are ``MoveSuggestion`` with player-POV scores; ``white_to_move``
+    is the analysed board's side to move, used to flip those scores to absolute."""
     anns: list[Annotation] = []
     if opp_move is not None and show_opponent:
         anns.append(Annotation(move=opp_move, rank=1, opponent=True))
-    for s in suggestions:
-        anns.append(Annotation(move=s.move, rank=s.rank, label=s.eval_text(), opponent=False))
+    flip = not white_to_move
+    for s, strength in zip(suggestions, _relative_strengths(suggestions)):
+        abs_cp = (-s.score_cp if (flip and s.score_cp is not None) else s.score_cp)
+        abs_mate = (-s.mate_in if (flip and s.mate_in is not None) else s.mate_in)
+        anns.append(Annotation(move=s.move, rank=s.rank, opponent=False,
+                               label=s.eval_text_pov(flip), score_cp=abs_cp,
+                               mate=abs_mate, strength=strength))
     return anns
 
 
@@ -164,13 +211,11 @@ class _OverlayWindow(QtWidgets.QWidget):
         # Draw lower-ranked / opponent moves first so the best player move is on top.
         order = sorted(self._annotations, key=lambda a: (not a.opponent, -a.rank))
         for ann in order:
-            shades = RED_SHADES if ann.opponent else GREEN_SHADES
-            color = shades[(ann.rank - 1) % len(shades)]
-            self._draw_move(painter, ann, color)
+            self._draw_move(painter, ann)
 
-    def _draw_move(self, painter: QtGui.QPainter, ann: Annotation,
-                   color: QtGui.QColor) -> None:
+    def _draw_move(self, painter: QtGui.QPainter, ann: Annotation) -> None:
         g = self._geometry
+        color = _arrow_color(ann)
         src = g.square_center(ann.move.from_square)
         dst = g.square_center(ann.move.to_square)
         radius = g.square * 0.42
@@ -182,7 +227,7 @@ class _OverlayWindow(QtWidgets.QWidget):
 
         self._draw_arrow(painter, src, dst, color, g.square)
         if ann.label:
-            self._draw_label(painter, dst, ann.label, color, g.square)
+            self._draw_label(painter, dst, ann.label, _eval_text_color(ann), g.square)
 
     @staticmethod
     def _draw_arrow(painter: QtGui.QPainter, start: QtCore.QPointF,
@@ -214,16 +259,17 @@ class _OverlayWindow(QtWidgets.QWidget):
 
     @staticmethod
     def _draw_label(painter: QtGui.QPainter, at: QtCore.QPointF, text: str,
-                    color: QtGui.QColor, square: float) -> None:
+                    text_color: QtGui.QColor, square: float) -> None:
         font = painter.font()
         font.setPixelSize(max(10, int(square * 0.22)))
         font.setBold(True)
         painter.setFont(font)
         box = QtCore.QRectF(at.x() - square / 2, at.y() - square / 2,
-                            square, square * 0.3)
-        painter.fillRect(box, QtGui.QColor(color.red(), color.green(),
-                                           color.blue(), 220))
-        painter.setPen(QtGui.QPen(QtGui.QColor(20, 20, 20)))
+                            square, square * 0.32)
+        painter.setPen(QtCore.Qt.NoPen)
+        painter.setBrush(QtGui.QColor(15, 15, 15, 205))   # dark chip so the number reads anywhere
+        painter.drawRoundedRect(box, 4, 4)
+        painter.setPen(QtGui.QPen(text_color))
         painter.drawText(box, QtCore.Qt.AlignCenter, text)
 
 

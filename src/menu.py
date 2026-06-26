@@ -5,6 +5,8 @@ the game tracker. Board + vision calibration are in memory only (see config.py).
 """
 from __future__ import annotations
 
+import ctypes
+import ctypes.wintypes
 import os
 from pathlib import Path
 
@@ -32,6 +34,21 @@ FRAME_MIN = 0.45         # min per-frame match quality to treat it as a real boa
 NO_BOARD_CERT = 0.30     # sustained reads below this => clearly no board (clear arrows)
 NO_BOARD_FRAMES = 4
 RESYNC_CONFIRM = 2       # stable non-legal reads before resyncing (filters drags)
+
+
+def _left_mouse_down() -> bool:
+    """Is the physical left mouse button currently held (anywhere)?"""
+    try:
+        return bool(ctypes.windll.user32.GetAsyncKeyState(0x01) & 0x8000)
+    except Exception:
+        return False
+
+
+def _cursor_xy() -> tuple[int, int]:
+    pt = ctypes.wintypes.POINT()
+    ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+    return int(pt.x), int(pt.y)
+
 
 _GLYPHS = {"k": "♚", "q": "♛", "r": "♜",
            "b": "♝", "n": "♞", "p": "♟"}
@@ -220,6 +237,9 @@ class MenuWindow(QtWidgets.QWidget):
         self.predict_cb = QtWidgets.QCheckBox("Show opponent's best move (red) on their turn")
         self.predict_cb.setChecked(self.cfg.show_predicted)
         top.addRow(self.predict_cb)
+        self.pause_drag_cb = QtWidgets.QCheckBox("Pause eval while dragging a piece")
+        self.pause_drag_cb.setChecked(self.cfg.pause_on_drag)
+        top.addRow(self.pause_drag_cb)
         self.turn_label = QtWidgets.QLabel("To move: —")
         self.flip_turn_btn = QtWidgets.QPushButton("Flip side to move")
         top.addRow(self.turn_label, self.flip_turn_btn)
@@ -266,7 +286,7 @@ class MenuWindow(QtWidgets.QWidget):
         self.reset_game_btn.clicked.connect(self._on_reset_game)
         self.flip_turn_btn.clicked.connect(self._on_flip_turn)
         for wdg in (self.show_arrows_cb, self.white_bottom_cb,
-                    self.allow_illegal_cb, self.predict_cb):
+                    self.allow_illegal_cb, self.predict_cb, self.pause_drag_cb):
             wdg.toggled.connect(self._on_settings_changed)
         for cb in (self.monitor_combo, self.mode_combo, self.side_combo):
             cb.currentIndexChanged.connect(self._on_settings_changed)
@@ -360,13 +380,15 @@ class MenuWindow(QtWidgets.QWidget):
             return
         try:
             self.results_list.clear()
-            for s in suggestions:        # analysed side IS the player -> eval already player-POV
+            flip = board.turn != chess.WHITE     # show eval ABSOLUTE (white +, black -)
+            for s in suggestions:
                 try:
                     san = board.san(s.move)
                 except Exception:
                     san = s.uci
-                self.results_list.addItem(f"#{s.rank}  {san:7s} {s.eval_text()}")
-            self._suggestions = build_annotations(suggestions, opp_move, self.cfg.show_predicted)
+                self.results_list.addItem(f"#{s.rank}  {san:7s} {s.eval_text_pov(flip)}")
+            self._suggestions = build_annotations(suggestions, opp_move, self.cfg.show_predicted,
+                                                  board.turn == chess.WHITE)
             self._draw_arrows()
             if opp_move is not None:
                 try:
@@ -397,6 +419,7 @@ class MenuWindow(QtWidgets.QWidget):
         self.cfg.white_bottom = self.white_bottom_cb.isChecked()
         self.cfg.allow_illegal = self.allow_illegal_cb.isChecked()
         self.cfg.show_predicted = self.predict_cb.isChecked()
+        self.cfg.pause_on_drag = self.pause_drag_cb.isChecked()
         self.cfg.save()
         self.overlay.set_overlay_visible(self.cfg.show_arrows)
         if self._geometry is not None:
@@ -563,8 +586,21 @@ class MenuWindow(QtWidgets.QWidget):
             self._stop_tracking()
             self.status_label.setText("Auto-tracking off.")
 
+    def _dragging_on_board(self) -> bool:
+        """True while the left mouse button is held with the cursor over the board
+        — i.e. a piece is being moved. Used to freeze recognition/eval so a drag
+        doesn't spray transient positions at the engine."""
+        if self._cap_region is None or not _left_mouse_down():
+            return False
+        x, y = _cursor_xy()
+        left, top, w, h = self._cap_region
+        return left <= x < left + w and top <= y < top + h
+
     def _on_frame(self, raw: chess.Board, debug: list) -> None:
         try:
+            if self.cfg.pause_on_drag and self._dragging_on_board():
+                return   # piece held on the board: freeze the eval, keep current arrows,
+                         # and don't feed mid-drag junk to the engine
             frame_cert = certainty(debug)
             self._cert_ema = 0.6 * self._cert_ema + 0.4 * frame_cert
             self._update_certainty(self._cert_ema)
