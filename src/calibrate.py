@@ -12,8 +12,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
+import cv2
 from PySide6 import QtCore, QtGui, QtWidgets
 
+from src.board_detect import find_board
+from src.capture import ScreenCapture
 from src.displays import MonitorInfo, monitor_from_hwnd
 from src.overlay import BoardGeometry
 
@@ -30,9 +33,10 @@ class CalibrationResult:
 class RegionSelector(QtWidgets.QWidget):
     """A translucent, interactive full-monitor window to drag-select a square."""
 
-    def __init__(self, screen: QtGui.QScreen):
+    def __init__(self, screen: QtGui.QScreen, rough: bool = False):
         super().__init__()
         self._screen = screen
+        self._rough = rough
         self.setWindowFlags(
             QtCore.Qt.FramelessWindowHint
             | QtCore.Qt.WindowStaysOnTopHint
@@ -91,9 +95,11 @@ class RegionSelector(QtWidgets.QWidget):
         font.setPixelSize(18)
         font.setBold(True)
         p.setFont(font)
+        msg = ("Drag a ROUGH box around the board — it snaps to the exact board.  Esc to cancel."
+               if self._rough else
+               "Drag a box over the board (corner to corner).  Esc to cancel.")
         p.drawText(self.rect().adjusted(0, 24, 0, 0),
-                   QtCore.Qt.AlignHCenter | QtCore.Qt.AlignTop,
-                   "Drag a box over the board (corner to corner).  Esc to cancel.")
+                   QtCore.Qt.AlignHCenter | QtCore.Qt.AlignTop, msg)
         if self._origin is not None and self._current is not None:
             rect = QtCore.QRectF(self._origin, self._current).normalized()
             p.setCompositionMode(QtGui.QPainter.CompositionMode_Clear)
@@ -109,25 +115,12 @@ class RegionSelector(QtWidgets.QWidget):
                        f"{int(side)}x{int(side)} px  (square ≈ {side / 8:.0f}px)")
 
 
-def calibrate(app: QtWidgets.QApplication, screen_index: int,
-              white_bottom: bool) -> Optional[CalibrationResult]:
-    screens = app.screens()
-    screen_index = max(0, min(screen_index, len(screens) - 1))
-    screen = screens[screen_index]
-
-    selector = RegionSelector(screen)
-    rect = selector.select()
-    if rect is None or rect.width() < 16 or rect.height() < 16:
-        return None
-
-    side_logical = (rect.width() + rect.height()) / 2.0
-    lx, ly = rect.x(), rect.y()
-
-    mon = selector.monitor
-    scale = mon.scale if mon else screen.devicePixelRatio()
-    m_left = mon.left if mon else int(round(screen.geometry().x() * scale))
-    m_top = mon.top if mon else int(round(screen.geometry().y() * scale))
-
+def _build_result(screen, screen_index, monitor, lx, ly, side_logical,
+                  white_bottom) -> CalibrationResult:
+    """A CalibrationResult from a board rect given in this screen's logical px."""
+    scale = monitor.scale if monitor else screen.devicePixelRatio()
+    m_left = monitor.left if monitor else int(round(screen.geometry().x() * scale))
+    m_top = monitor.top if monitor else int(round(screen.geometry().y() * scale))
     geometry = BoardGeometry(
         origin_x=screen.geometry().x() + lx,        # global logical
         origin_y=screen.geometry().y() + ly,
@@ -141,3 +134,64 @@ def calibrate(app: QtWidgets.QApplication, screen_index: int,
         phys_side=int(round(side_logical * scale)),
         geometry=geometry,
     )
+
+
+def _pick_screen(app, screen_index):
+    screens = app.screens()
+    i = max(0, min(screen_index, len(screens) - 1))
+    return i, screens[i]
+
+
+def calibrate(app: QtWidgets.QApplication, screen_index: int,
+              white_bottom: bool) -> Optional[CalibrationResult]:
+    """Manual calibration — drag a box over the board (the box IS the region)."""
+    screen_index, screen = _pick_screen(app, screen_index)
+    selector = RegionSelector(screen)
+    rect = selector.select()
+    if rect is None or rect.width() < 16 or rect.height() < 16:
+        return None
+    side = (rect.width() + rect.height()) / 2.0
+    return _build_result(screen, screen_index, selector.monitor,
+                         rect.x(), rect.y(), side, white_bottom)
+
+
+def auto_calibrate(app: QtWidgets.QApplication, screen_index: int,
+                   white_bottom: bool) -> Optional[CalibrationResult]:
+    """Auto-align calibration — drag a ROUGH box; snap to the exact board.
+
+    Returns the SAME result type as ``calibrate`` (so it feeds identical
+    downstream state), or None if no board is confidently found (caller falls
+    back to a message / manual mode). The piece recognition is untouched."""
+    screen_index, screen = _pick_screen(app, screen_index)
+    selector = RegionSelector(screen, rough=True)
+    rect = selector.select()
+    if rect is None or rect.width() < 48 or rect.height() < 48:
+        return None
+    selector.hide()
+    for _ in range(6):                      # let the selector overlay leave the screen
+        QtWidgets.QApplication.processEvents()
+        QtCore.QThread.msleep(15)
+
+    monitor = selector.monitor
+    scale = monitor.scale if monitor else screen.devicePixelRatio()
+    m_left = monitor.left if monitor else int(round(screen.geometry().x() * scale))
+    m_top = monitor.top if monitor else int(round(screen.geometry().y() * scale))
+    px, py = int(round(m_left + rect.x() * scale)), int(round(m_top + rect.y() * scale))
+    pw, ph = int(round(rect.width() * scale)), int(round(rect.height() * scale))
+
+    cap = ScreenCapture()
+    try:
+        img = cap.grab(px, py, pw, ph)
+    except Exception:
+        return None
+    finally:
+        cap.close()
+
+    region = find_board(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))
+    if region is None:
+        return None
+    dx, dy, dw, dh = region                 # board within the grabbed region (physical px)
+    side_phys = (dw + dh) / 2.0
+    return _build_result(screen, screen_index, monitor,
+                         rect.x() + dx / scale, rect.y() + dy / scale,
+                         side_phys / scale, white_bottom)

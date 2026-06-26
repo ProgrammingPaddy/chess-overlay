@@ -188,6 +188,7 @@ class _OverlayWindow(QtWidgets.QWidget):
         self._geometry: BoardGeometry | None = None
         self._annotations: list[Annotation] = []
         self._visible = True
+        self._show_border = False
 
         self.setWindowFlags(
             QtCore.Qt.FramelessWindowHint
@@ -218,16 +219,17 @@ class _OverlayWindow(QtWidgets.QWidget):
             pass
 
     # --------------------------------------------------------------- state
-    def apply(self, geometry: BoardGeometry | None,
-              annotations: list[Annotation], visible: bool) -> None:
+    def apply(self, geometry: BoardGeometry | None, annotations: list[Annotation],
+              visible: bool, show_border: bool = False) -> None:
         self._geometry = geometry
         self._annotations = annotations
         self._visible = visible
+        self._show_border = show_border
         self.update()
 
     # -------------------------------------------------------------- paint
     def paintEvent(self, event: QtGui.QPaintEvent) -> None:
-        if not (self._visible and self._geometry and self._annotations):
+        if not (self._visible and self._geometry):
             return
         # Window-local (0,0) == this screen's global top-left, so shift global
         # logical coordinates into local space and let Qt handle this monitor's
@@ -236,10 +238,24 @@ class _OverlayWindow(QtWidgets.QWidget):
         painter = QtGui.QPainter(self)
         painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
         painter.translate(-origin.x(), -origin.y())
+        if self._show_border:
+            self._draw_border(painter, self._geometry)
         # Draw lower-ranked / opponent moves first so the best player move is on top.
-        order = sorted(self._annotations, key=lambda a: (not a.opponent, -a.rank))
-        for ann in order:
+        for ann in sorted(self._annotations, key=lambda a: (not a.opponent, -a.rank)):
             self._draw_move(painter, ann)
+
+    @staticmethod
+    def _draw_border(painter: QtGui.QPainter, g: BoardGeometry) -> None:
+        """The calibrated board outline + grid, so the user can see what was found."""
+        side = g.square * 8
+        painter.setBrush(QtCore.Qt.NoBrush)
+        painter.setPen(QtGui.QPen(QtGui.QColor(0, 220, 255, 235), max(2.0, g.square * 0.05)))
+        painter.drawRect(QtCore.QRectF(g.origin_x, g.origin_y, side, side))
+        painter.setPen(QtGui.QPen(QtGui.QColor(0, 220, 255, 90), 1.0))
+        for k in range(1, 8):
+            x, y = g.origin_x + k * g.square, g.origin_y + k * g.square
+            painter.drawLine(QtCore.QPointF(x, g.origin_y), QtCore.QPointF(x, g.origin_y + side))
+            painter.drawLine(QtCore.QPointF(g.origin_x, y), QtCore.QPointF(g.origin_x + side, y))
 
     def _draw_move(self, painter: QtGui.QPainter, ann: Annotation) -> None:
         g = self._geometry
@@ -308,11 +324,17 @@ class OverlayManager:
         self._geometry: BoardGeometry | None = None
         self._annotations: list[Annotation] = []
         self._visible = True
+        self._show_border = False
         self._windows = [_OverlayWindow(s) for s in app.screens()]
 
     def _refresh(self) -> None:
         for w in self._windows:
-            w.apply(self._geometry, self._annotations, self._visible)
+            w.apply(self._geometry, self._annotations, self._visible, self._show_border)
+
+    def set_show_border(self, show: bool) -> None:
+        """Toggle the calibrated board outline (verification aid for both modes)."""
+        self._show_border = show
+        self._refresh()
 
     def set_board_geometry(self, geometry: BoardGeometry) -> None:
         self._geometry = geometry

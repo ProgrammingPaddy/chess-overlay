@@ -14,7 +14,7 @@ import chess
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from src.analysis import EngineController
-from src.calibrate import calibrate
+from src.calibrate import auto_calibrate, calibrate
 from src.capture import ScreenCapture, save_image
 from src.config import Config
 from src.consensus import ConsensusBuffer
@@ -130,6 +130,7 @@ class MenuWindow(QtWidgets.QWidget):
 
         self.overlay.show()
         self.overlay.set_overlay_visible(self.cfg.show_arrows)
+        self.overlay.set_show_border(self.cfg.show_border)
         self._refresh_board_status()
         self._refresh_vision_status()
         self._init_controller()
@@ -163,17 +164,22 @@ class MenuWindow(QtWidgets.QWidget):
         self.monitor_combo.setCurrentIndex(
             max(0, min(self.cfg.board_monitor, self.monitor_combo.count() - 1)))
         bf.addRow("Monitor", self.monitor_combo)
-        self.calibrate_btn = QtWidgets.QPushButton("Calibrate board (drag a box)…")
+        self.calibrate_btn = QtWidgets.QPushButton("Calibrate board — manual (drag a box)…")
+        self.auto_calibrate_btn = QtWidgets.QPushButton("Calibrate board — auto-align (rough box)…")
         bf.addRow(self.calibrate_btn)
+        bf.addRow(self.auto_calibrate_btn)
         self.board_status = QtWidgets.QLabel()
         self.board_status.setWordWrap(True)
         bf.addRow(self.board_status)
+        self.show_border_cb = QtWidgets.QCheckBox("Show calibrated board border")
+        self.show_border_cb.setChecked(self.cfg.show_border)
         self.show_arrows_cb = QtWidgets.QCheckBox("Show arrows on board")
         self.show_arrows_cb.setChecked(self.cfg.show_arrows)
         self.gold_moves_cb = QtWidgets.QCheckBox("Highlight a clearly-best / mate move in gold")
         self.gold_moves_cb.setChecked(self.cfg.gold_moves)
         self.white_bottom_cb = QtWidgets.QCheckBox("White on bottom")
         self.white_bottom_cb.setChecked(self.cfg.white_bottom)
+        bf.addRow(self.show_border_cb)
         bf.addRow(self.show_arrows_cb)
         bf.addRow(self.gold_moves_cb)
         bf.addRow(self.white_bottom_cb)
@@ -280,6 +286,7 @@ class MenuWindow(QtWidgets.QWidget):
 
     def _connect_signals(self) -> None:
         self.calibrate_btn.clicked.connect(self._on_calibrate)
+        self.auto_calibrate_btn.clicked.connect(self._on_auto_calibrate)
         self.analyze_btn.clicked.connect(self._on_analyze)
         self.stop_btn.clicked.connect(self._on_stop)
         self.snapshot_btn.clicked.connect(self._on_snapshot)
@@ -288,8 +295,9 @@ class MenuWindow(QtWidgets.QWidget):
         self.track_cb.toggled.connect(self._on_track_toggled)
         self.reset_game_btn.clicked.connect(self._on_reset_game)
         self.flip_turn_btn.clicked.connect(self._on_flip_turn)
-        for wdg in (self.show_arrows_cb, self.gold_moves_cb, self.white_bottom_cb,
-                    self.allow_illegal_cb, self.predict_cb, self.pause_drag_cb):
+        for wdg in (self.show_arrows_cb, self.gold_moves_cb, self.show_border_cb,
+                    self.white_bottom_cb, self.allow_illegal_cb, self.predict_cb,
+                    self.pause_drag_cb):
             wdg.toggled.connect(self._on_settings_changed)
         for cb in (self.monitor_combo, self.mode_combo, self.side_combo):
             cb.currentIndexChanged.connect(self._on_settings_changed)
@@ -420,12 +428,14 @@ class MenuWindow(QtWidgets.QWidget):
         self.cfg.board_monitor = self._monitor_index()
         self.cfg.show_arrows = self.show_arrows_cb.isChecked()
         self.cfg.gold_moves = self.gold_moves_cb.isChecked()
+        self.cfg.show_border = self.show_border_cb.isChecked()
         self.cfg.white_bottom = self.white_bottom_cb.isChecked()
         self.cfg.allow_illegal = self.allow_illegal_cb.isChecked()
         self.cfg.show_predicted = self.predict_cb.isChecked()
         self.cfg.pause_on_drag = self.pause_drag_cb.isChecked()
         self.cfg.save()
         self.overlay.set_overlay_visible(self.cfg.show_arrows)
+        self.overlay.set_show_border(self.cfg.show_border)
         if self._geometry is not None:
             self._geometry.white_bottom = self.cfg.white_bottom
             self.overlay.set_board_geometry(self._geometry)
@@ -443,6 +453,25 @@ class MenuWindow(QtWidgets.QWidget):
         if result is None:
             self.status_label.setText("Calibration cancelled.")
             return
+        self._apply_calibration(result, "manual")
+
+    def _on_auto_calibrate(self) -> None:
+        self.hide()
+        QtWidgets.QApplication.processEvents()
+        result = auto_calibrate(self._app, self._monitor_index(), self.cfg.white_bottom)
+        self.show()
+        self.raise_()
+        if result is None:
+            self.status_label.setText(
+                "Auto-align: no board found — drag a tighter box around just the board, "
+                "or use manual calibration.")
+            return
+        self._apply_calibration(result, "auto-aligned")
+        if not self.cfg.show_border:                 # reveal what it found so you can verify
+            self.show_border_cb.setChecked(True)
+
+    def _apply_calibration(self, result, how: str) -> None:
+        """Adopt a calibration result (manual or auto) — identical downstream state."""
         self.cfg.board_monitor = result.screen_index
         self.cfg.save()
         self._geometry = result.geometry
@@ -462,7 +491,7 @@ class MenuWindow(QtWidgets.QWidget):
         self._refresh_vision_status()
         self._on_snapshot()
         self.status_label.setText(
-            f"Board calibrated ({result.phys_side}px). Now Calibrate vision for THIS board.")
+            f"Board calibrated ({how}, {result.phys_side}px). Now Calibrate vision for THIS board.")
 
     def _on_analyze(self) -> None:
         try:
