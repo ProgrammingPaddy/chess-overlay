@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Local settings written at runtime
+config.json
+
+# Engine binaries (download separately; can be large)
+engines/*.exe
+engines/stockfish
+engines/*.zip
+
+# Captured / debug images
+debug/
+*.png
+!assets/**/*.png
+# real-board test fixtures are required by the tests
+!tests/*.png
+
+# Stale local artifact (old vision template dump; nothing loads it)
+*.npz

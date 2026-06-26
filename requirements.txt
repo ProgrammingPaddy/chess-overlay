@@ -1,0 +1,12 @@
+# Chess Overlay — Python dependencies (Windows, Python 3.10+)
+
+# --- Core (Phase 1) ---
+chess>=1.10          # python-chess: board model + UCI engine communication
+PySide6>=6.6         # Qt: the transparent overlay window and options menu
+pywin32>=306         # Win32 ext-styles for true click-through layered window
+
+# --- Vision (Phase 2) ---
+dxcam>=0.0.5         # very fast DirectX screen capture on Windows
+mss>=9.0             # portable screen-capture fallback
+opencv-python>=4.9   # board detection + piece recognition
+numpy>=1.26
