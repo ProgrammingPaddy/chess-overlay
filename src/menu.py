@@ -19,6 +19,7 @@ from src.capture import ScreenCapture, save_image
 from src.config import Config
 from src.consensus import ConsensusBuffer
 from src.engine import find_stockfish
+from src.openings import identify as identify_opening
 from src.overlay import (Annotation, BoardGeometry, OverlayManager,
                          build_annotations, visible_annotations)
 from src.tracker import GameTracker
@@ -920,6 +921,11 @@ class MenuWindow(QtWidgets.QWidget):
 
     def _refresh_moves(self) -> None:
         self.moves_view.setPlainText(self.tracker.san_line())
+        self._refresh_opening()
+
+    def _refresh_opening(self) -> None:
+        name = identify_opening(self.tracker.board)
+        self.opening_label.setText(f"Opening: {name}" if name else "Opening: —")
 
     # ---------------------------------------------------------------- lifecycle
     def closeEvent(self, e: QtGui.QCloseEvent) -> None:
