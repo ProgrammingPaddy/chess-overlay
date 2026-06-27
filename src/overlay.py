@@ -53,6 +53,17 @@ def _advantage(ann: "Annotation") -> float:
     return (ann.score_cp / 100.0) if ann.score_cp is not None else 0.0
 
 
+def _player_advantage(ann: "Annotation") -> float:
+    """Advantage from the PLAYER's POV (+ good for the player). The eval NUMBER is
+    shown ABSOLUTE (negative = Black winning), but the green/grey arrow and the
+    number's colour must track whether the move is good FOR THE PLAYER — otherwise
+    a winning Black player sees their best moves greyed out and their evals in red,
+    because in absolute terms the advantage is negative. Side on bottom is the
+    player, so this is exactly the absolute value flipped for a Black player."""
+    a = _advantage(ann)
+    return a if ann.player_is_white else -a
+
+
 def _player_value(s) -> float:
     """Player-POV value (higher = better for the player) used to rank the moves."""
     if s.mate_in is not None:
@@ -101,7 +112,7 @@ def _arrow_color(ann: "Annotation") -> QtGui.QColor:
         return QtGui.QColor(*RED, alpha)
     if ann.gold:                              # the player's standout / mate -> gold
         return QtGui.QColor(*GOLD, alpha)
-    return QtGui.QColor(*(GREEN if _advantage(ann) >= 0 else GREY), alpha)
+    return QtGui.QColor(*(GREEN if _player_advantage(ann) >= 0 else GREY), alpha)
 
 
 def _eval_text_color(ann: "Annotation") -> QtGui.QColor:
@@ -109,7 +120,7 @@ def _eval_text_color(ann: "Annotation") -> QtGui.QColor:
         return QtGui.QColor(255, 70, 70) if ann.gold else QtGui.QColor(255, 140, 140)
     if ann.gold:
         return QtGui.QColor(255, 220, 90)
-    return QtGui.QColor(255, 95, 95) if _advantage(ann) < 0 else QtGui.QColor(120, 240, 150)
+    return QtGui.QColor(255, 95, 95) if _player_advantage(ann) < 0 else QtGui.QColor(120, 240, 150)
 
 
 @dataclass
@@ -139,15 +150,18 @@ class Annotation:
     rank: int = 1
     label: str = ""        # optional text near the destination (e.g. the eval)
     opponent: bool = False  # True => draw red (predicted opponent move)
-    score_cp: int | None = None    # ABSOLUTE centipawns (+ White, - Black) -> colour
+    score_cp: int | None = None    # ABSOLUTE centipawns (+ White, - Black) -> the number
     mate: int | None = None        # ABSOLUTE mate distance (+ White mates, - Black mates)
     strength: float = 1.0          # 0..1 relative standout among shown moves -> opacity
     gold: bool = False             # standout (>=1 pawn clear) or forced-mate move
+    player_is_white: bool = True   # which colour the player is -> green/grey is player-POV
 
 
-def _styled_set(suggestions, opponent: bool, flip: bool, gold: bool) -> list["Annotation"]:
+def _styled_set(suggestions, opponent: bool, flip: bool, gold: bool,
+                player_is_white: bool) -> list["Annotation"]:
     """Annotations for one side: relative opacity within the set + a dominant flag,
-    eval shown ABSOLUTE (+ White, - Black). ``flip`` negates the side-to-move score."""
+    eval shown ABSOLUTE (+ White, - Black). ``flip`` negates the side-to-move score;
+    ``player_is_white`` lets the green/grey colour track the PLAYER's POV."""
     strengths = _relative_strengths(suggestions)
     golds = _gold_strengths(suggestions) if gold else {}
     out = []
@@ -157,7 +171,8 @@ def _styled_set(suggestions, opponent: bool, flip: bool, gold: bool) -> list["An
         dom = i in golds
         out.append(Annotation(move=s.move, rank=s.rank, opponent=opponent,
                               label=s.eval_text_pov(flip), score_cp=abs_cp, mate=abs_mate,
-                              strength=(golds[i] if dom else strengths[i]), gold=dom))
+                              strength=(golds[i] if dom else strengths[i]), gold=dom,
+                              player_is_white=player_is_white))
     return out
 
 
@@ -171,12 +186,18 @@ def build_annotations(suggestions, opp_suggestions=None, show_opponent=True,
         an overwhelmingly strong reply in very dark red.
 
     Opacity is RELATIVE within each side; eval numbers are ABSOLUTE (+ White,
-    - Black). ``white_to_move`` is the player-position's side to move; the opponent
-    moved one ply earlier, so their scores flip the opposite way."""
+    - Black). ``white_to_move`` is the player-position's side to move; since the
+    analysed position is always one where it is the PLAYER's turn (we push the
+    opponent's move first when looking ahead), ``white_to_move`` IS 'the player is
+    White' — so it both flips the scores and selects the player's POV colour. The
+    opponent moved one ply earlier, so their scores flip the opposite way."""
+    player_is_white = white_to_move
     anns: list[Annotation] = []
     if opp_suggestions and show_opponent:
-        anns += _styled_set(opp_suggestions, opponent=True, flip=white_to_move, gold=gold_enabled)
-    anns += _styled_set(suggestions, opponent=False, flip=not white_to_move, gold=gold_enabled)
+        anns += _styled_set(opp_suggestions, opponent=True, flip=white_to_move,
+                            gold=gold_enabled, player_is_white=player_is_white)
+    anns += _styled_set(suggestions, opponent=False, flip=not white_to_move,
+                        gold=gold_enabled, player_is_white=player_is_white)
     return anns
 
 

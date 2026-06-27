@@ -134,6 +134,7 @@ class MenuWindow(QtWidgets.QWidget):
         self._refresh_board_status()
         self._refresh_vision_status()
         self._init_controller()
+        self._reconcile_orientation_controls()
         self._loading = False
 
     # ------------------------------------------------------------------ UI
@@ -299,11 +300,15 @@ class MenuWindow(QtWidgets.QWidget):
         self.reset_game_btn.clicked.connect(self._on_reset_game)
         self.newgame_btn.clicked.connect(self._on_new_game)
         self.flip_turn_btn.clicked.connect(self._on_flip_turn)
+        # Orientation == player colour (side on bottom is the player), so the
+        # 'White on bottom' checkbox and the 'I play as' combo get dedicated
+        # handlers that flip the board AND re-run analysis immediately.
+        self.white_bottom_cb.toggled.connect(self._on_white_bottom_toggled)
+        self.side_combo.currentIndexChanged.connect(self._on_side_changed)
         for wdg in (self.show_arrows_cb, self.gold_moves_cb, self.show_border_cb,
-                    self.white_bottom_cb, self.allow_illegal_cb, self.predict_cb,
-                    self.pause_drag_cb):
+                    self.allow_illegal_cb, self.predict_cb, self.pause_drag_cb):
             wdg.toggled.connect(self._on_settings_changed)
-        for cb in (self.monitor_combo, self.mode_combo, self.side_combo):
+        for cb in (self.monitor_combo, self.mode_combo):
             cb.currentIndexChanged.connect(self._on_settings_changed)
         for sp in (self.depth_spin, self.lines_spin, self.threads_spin, self.hash_spin):
             sp.valueChanged.connect(self._on_settings_changed)
@@ -357,19 +362,90 @@ class MenuWindow(QtWidgets.QWidget):
         self.stop_btn.setEnabled(True)
 
     def _player_color(self) -> bool:
-        """Which colour the human plays. 'Auto' = the side at the bottom of the
-        board (the orientation already set for vision), so it is never ambiguous
-        and the look-ahead always knows whose turn it is. White/Black override."""
-        if self.cfg.analyze_for == "white":
-            return chess.WHITE
-        if self.cfg.analyze_for == "black":
-            return chess.BLACK
+        """Which colour the human plays. The contract is 'side on bottom is the
+        player', so this is derived from the board orientation alone — a single
+        source of truth shared with vision and the overlay. The 'I play as' control
+        sets the orientation (see ``_on_side_changed``), so they can never disagree
+        and the look-ahead always knows whose turn it is."""
         return chess.WHITE if self.cfg.white_bottom else chess.BLACK
 
     def _stop_analysis(self) -> None:
         if self._controller is not None:
             self._controller.clear()
         self.stop_btn.setEnabled(False)
+
+    def _reanalyze_current(self) -> None:
+        """Force a re-analysis of the current position. Used when something that
+        changes the engine output or the player/opponent split (orientation, side,
+        lines, gold, reds) changes — the position is the same, so the normal
+        'unchanged position' guard would otherwise suppress the update."""
+        if self._controller is None:
+            return
+        board = self.tracker.board
+        if board is None:
+            return
+        self._analyzing_key = None        # defeat the unchanged-position guard
+        self._start_analysis(board)
+
+    # ----------------------------------------------------- orientation / side
+    def _sync_white_bottom_cb(self) -> None:
+        self.white_bottom_cb.blockSignals(True)
+        self.white_bottom_cb.setChecked(self.cfg.white_bottom)
+        self.white_bottom_cb.blockSignals(False)
+
+    def _sync_side_combo(self) -> None:
+        self.side_combo.blockSignals(True)
+        self.side_combo.setCurrentIndex(max(0, self.side_combo.findData(self.cfg.analyze_for)))
+        self.side_combo.blockSignals(False)
+
+    def _apply_orientation(self, white_bottom: bool) -> None:
+        """Adopt a board orientation. 'Side on bottom is the player', so this also
+        decides which colour the engine analyses for. Re-runs analysis so the
+        green/red (player/opponent) split flips immediately, not on the next move."""
+        self.cfg.white_bottom = white_bottom
+        self._sync_white_bottom_cb()
+        self.cfg.save()
+        if self._geometry is not None:
+            self._geometry.white_bottom = white_bottom
+            self.overlay.set_board_geometry(self._geometry)
+        if self._believed is not None:
+            self.mini_board.set_board(self._believed, white_bottom)
+        self._refresh_turn_label()
+        self._reanalyze_current()
+
+    def _on_side_changed(self, *_) -> None:
+        """'I play as' — Auto follows the calibrated orientation; White/Black force
+        it (and so flip the board), keeping a single source of truth."""
+        if self._loading:
+            return
+        data = self.side_combo.currentData()
+        self.cfg.analyze_for = data
+        if data == "white":
+            wb = True
+        elif data == "black":
+            wb = False
+        else:                              # auto: the side calibration found on the bottom
+            wb = self.vision.white_bottom if self.vision.calibrated else self.cfg.white_bottom
+        self._apply_orientation(wb)
+
+    def _on_white_bottom_toggled(self, on: bool) -> None:
+        """Manually flipping the board is an explicit colour choice (you are the
+        side on the bottom), so keep 'I play as' in step with it."""
+        if self._loading:
+            return
+        self.cfg.analyze_for = "white" if on else "black"
+        self._sync_side_combo()
+        self._apply_orientation(on)
+
+    def _reconcile_orientation_controls(self) -> None:
+        """At startup make orientation and 'I play as' agree (side on bottom is the
+        player) — a config from before this contract could have them disagree."""
+        if self.cfg.analyze_for == "white":
+            self.cfg.white_bottom = True
+        elif self.cfg.analyze_for == "black":
+            self.cfg.white_bottom = False
+        self._sync_white_bottom_cb()
+        self._sync_side_combo()
 
     def _refresh_board_status(self) -> None:
         if self._cap_region is None:
@@ -440,30 +516,36 @@ class MenuWindow(QtWidgets.QWidget):
     def _on_settings_changed(self, *_) -> None:
         if self._loading:
             return
+        # Orientation / player colour are owned by the dedicated handlers
+        # (_on_side_changed / _on_white_bottom_toggled), not read here.
+        before = (self.cfg.multipv, self.cfg.engine_depth, self.cfg.engine_mode,
+                  self.cfg.gold_moves, self.cfg.show_predicted)
         self.cfg.engine_depth = self.depth_spin.value()
         self.cfg.multipv = self.lines_spin.value()
         self.cfg.engine_threads = self.threads_spin.value()
         self.cfg.engine_hash_mb = self.hash_spin.value()
         self.cfg.engine_mode = self.mode_combo.currentData()
-        self.cfg.analyze_for = self.side_combo.currentData()
         self.cfg.board_monitor = self._monitor_index()
         self.cfg.show_arrows = self.show_arrows_cb.isChecked()
         self.cfg.gold_moves = self.gold_moves_cb.isChecked()
         self.cfg.show_border = self.show_border_cb.isChecked()
-        self.cfg.white_bottom = self.white_bottom_cb.isChecked()
         self.cfg.allow_illegal = self.allow_illegal_cb.isChecked()
         self.cfg.show_predicted = self.predict_cb.isChecked()
         self.cfg.pause_on_drag = self.pause_drag_cb.isChecked()
         self.cfg.save()
         self.overlay.set_overlay_visible(self.cfg.show_arrows)
         self.overlay.set_show_border(self.cfg.show_border)
-        if self._geometry is not None:
-            self._geometry.white_bottom = self.cfg.white_bottom
-            self.overlay.set_board_geometry(self._geometry)
         sig = (self.cfg.engine_threads, self.cfg.engine_hash_mb)
         if self._controller is not None and sig != self._eng_sig:
             self._eng_sig = sig
             self._controller.reconfigure(*sig)
+        # A change that affects the engine output or the arrows (lines, depth,
+        # mode, gold, opponent-reds) re-runs analysis so the toggle takes effect
+        # now instead of only on the next move.
+        after = (self.cfg.multipv, self.cfg.engine_depth, self.cfg.engine_mode,
+                 self.cfg.gold_moves, self.cfg.show_predicted)
+        if after != before:
+            self._reanalyze_current()
 
     def _on_calibrate(self) -> None:
         self.hide()
@@ -552,13 +634,22 @@ class MenuWindow(QtWidgets.QWidget):
         self._stop_tracking()        # don't write the model while the worker reads it
         # Calibration reads the true orientation from the board pixels (the white
         # army is brighter). Adopt it so a stale 'White on bottom' setting can't
-        # 180-rotate the board (which inverts colours and swaps K<->Q). Setting the
-        # checkbox syncs cfg + overlay geometry + the mini-board.
+        # 180-rotate the board (which inverts colours and swaps K<->Q). This is the
+        # auto path, so reflect the detected side in BOTH controls (side on bottom
+        # is the player) — tracking restarts right after and re-runs the analysis.
         warning = self.vision.calibrate(img, self.cfg.white_bottom)
+        detected = self.vision.white_bottom
         note = ""
-        if self.vision.white_bottom != self.cfg.white_bottom:
-            self.white_bottom_cb.setChecked(self.vision.white_bottom)
-            note = f" (auto-detected {'White' if self.vision.white_bottom else 'Black'} on the bottom)"
+        if detected != self.cfg.white_bottom:
+            note = f" (auto-detected {'White' if detected else 'Black'} on the bottom)"
+        self.cfg.analyze_for = "auto"
+        self._sync_side_combo()
+        self.cfg.white_bottom = detected
+        self._sync_white_bottom_cb()
+        self.cfg.save()
+        if self._geometry is not None:
+            self._geometry.white_bottom = detected
+            self.overlay.set_board_geometry(self._geometry)
         dump_calibration(DEBUG_DIR, img, self.vision)
         self._refresh_vision_status()
         self._set_track_checkbox(True)
@@ -736,11 +827,50 @@ class MenuWindow(QtWidgets.QWidget):
     def _draw_arrows(self) -> None:
         self.overlay.set_annotations(visible_annotations(self._believed, self._suggestions))
 
+    def _recalibrate_to_live(self, require_start: bool) -> str:
+        """Best-effort re-calibration to whatever is on screen now (the existing
+        'Calibrate vision' routine — NOT a new CV path). Adopts the fresh model only
+        when it cleanly reads a START position, so a new game that flipped your
+        colour or changed the board theme is picked up automatically, while a
+        half-set board can never corrupt the templates. Restarts the worker so the
+        live read uses the new model. Returns a status note ('' if nothing adopted)."""
+        if not self.vision.calibrated:
+            return ""
+        img = self._grab_board()
+        if img is None:
+            return ""
+        trial = VisionModel()
+        try:
+            warning = trial.calibrate(img, self.cfg.white_bottom)
+            observed = trial.recognize(img)
+        except Exception:
+            return ""
+        if require_start and (warning or observed.board_fen() != chess.Board().board_fen()):
+            return ""                              # not a clean start — keep the trusted model
+        self.vision = trial
+        detected = trial.white_bottom
+        flipped = detected != self.cfg.white_bottom
+        if flipped:
+            self.cfg.analyze_for = "auto"
+            self._sync_side_combo()
+            self.cfg.white_bottom = detected
+            self._sync_white_bottom_cb()
+            if self._geometry is not None:
+                self._geometry.white_bottom = detected
+                self.overlay.set_board_geometry(self._geometry)
+            self.cfg.save()
+        self._refresh_vision_status()
+        if self._vision_worker is not None:        # rebuild the worker on the new model
+            self._start_tracking()
+        return (f" (recalibrated — {'White' if detected else 'Black'} on bottom)"
+                if flipped else " (recalibrated)")
+
     def _on_reset_game(self) -> None:
-        # Re-read the live board fresh: drop history/state, reseed from whatever is
-        # on screen right now, and restart analysis cleanly.
+        # Re-read the live board fresh: recalibrate if a start position is shown,
+        # then reseed from whatever is on screen and restart analysis cleanly.
         if self._controller is not None:
             self._controller.clear()
+        note = self._recalibrate_to_live(require_start=True)
         self._reset_tracking_state()
         observed = None
         if self.vision.calibrated:
@@ -751,18 +881,20 @@ class MenuWindow(QtWidgets.QWidget):
         self.overlay.clear()
         self.results_list.clear()
         self._after_commit()
-        self.status_label.setText("Re-read the board.")
+        self.status_label.setText("Re-read the board." + note)
 
     def _on_new_game(self) -> None:
-        # Clean reset to the start position (a fresh game from move 1).
+        # Clean reset to a fresh game from move 1. If a start position is on screen,
+        # recalibrate to it first so a colour/theme change carries over cleanly.
         if self._controller is not None:
             self._controller.clear()
+        note = self._recalibrate_to_live(require_start=True)
         self._reset_tracking_state()
         self.tracker.reset()                       # start position, White to move
         self.overlay.clear()
         self.results_list.clear()
         self._after_commit()
-        self.status_label.setText("New game — start position.")
+        self.status_label.setText("New game — start position." + note)
 
     def _refresh_moves(self) -> None:
         self.moves_view.setPlainText(self.tracker.san_line())
