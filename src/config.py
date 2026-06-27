@@ -31,6 +31,11 @@ class Config:
     opp_lookahead_live: bool = False
     opp_lookahead_depth: int = 12    # one-shot / preview depth (also the live-refine start)
     opp_lookahead_max: int = 22      # live-refine ceiling
+    # Player-eval strength limiter (simulated Elo). Default OFF = full strength,
+    # which must stay completely unaffected. Limits ONLY the player's eval
+    # (greens); the opponent prediction (reds) always stays full strength.
+    limit_player_strength: bool = False
+    player_elo: int = 1500
 
     # --- preferences (stable across sessions) ---
     board_monitor: int = 0

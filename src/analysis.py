@@ -40,14 +40,20 @@ class EngineController(QtCore.QThread):
         self._shutdown = False
         self._analysis = None
         self._engine: chess.engine.SimpleEngine | None = None
+        # Player-eval strength limiter (applied per-analysis; opponent stays full).
+        self._strength = (False, 0)            # (limit, elo) requested for THIS job
+        self._applied_strength: tuple | None = None   # what the engine is configured to now
+        self._strength_supported = False
+        self._elo_range = (1320, 3190)
 
     # ----- called from the GUI thread -----
     def request(self, board: chess.Board, multipv: int, mode: str, depth: int,
                 player_color: bool | None = None, token: int = 0,
-                opp_live: bool = False, opp_depth: int = 12, opp_max: int = 22) -> None:
+                opp_live: bool = False, opp_depth: int = 12, opp_max: int = 22,
+                limit_strength: bool = False, player_elo: int = 1500) -> None:
         with self._lock:
             self._pending = (board.copy(), multipv, mode, depth, player_color, token,
-                             opp_live, opp_depth, opp_max)
+                             opp_live, opp_depth, opp_max, limit_strength, player_elo)
         self._interrupt()
 
     def clear(self) -> None:
@@ -106,10 +112,50 @@ class EngineController(QtCore.QThread):
         try:
             self._engine = chess.engine.SimpleEngine.popen_uci(self._path)
             self._engine.configure({"Threads": self._threads, "Hash": self._hash})
+            self._detect_strength_support()
+            self._applied_strength = None       # a fresh engine is full strength; force re-apply
             return True
         except Exception as exc:
             self.failed.emit(f"engine failed to start: {exc}")
             return False
+
+    def _detect_strength_support(self) -> None:
+        """Note whether the engine exposes UCI_LimitStrength/UCI_Elo and its range."""
+        opts = getattr(self._engine, "options", {}) or {}
+        self._strength_supported = "UCI_LimitStrength" in opts and "UCI_Elo" in opts
+        if self._strength_supported:
+            o = opts["UCI_Elo"]
+            lo = int(getattr(o, "min", None) or 1320)
+            hi = int(getattr(o, "max", None) or 3190)
+            self._elo_range = (lo, hi)
+
+    def _set_strength(self, limited: bool, elo: int) -> None:
+        """Configure the engine's playing strength, caching to avoid redundant
+        setoptions. Off => UCI_LimitStrength false (native full strength, so the
+        default full-strength path is never altered). No-op if unsupported."""
+        if not self._strength_supported:
+            return
+        want = (bool(limited), int(elo) if limited else 0)
+        if want == self._applied_strength:
+            return
+        try:
+            if limited:
+                lo, hi = self._elo_range
+                self._engine.configure(
+                    {"UCI_LimitStrength": True, "UCI_Elo": max(lo, min(hi, int(elo)))})
+            else:
+                self._engine.configure({"UCI_LimitStrength": False})
+            self._applied_strength = want
+        except Exception:
+            pass
+
+    def _strength_full(self) -> None:
+        """Full strength — for the OPPONENT prediction (reds), always."""
+        self._set_strength(False, 0)
+
+    def _strength_player(self) -> None:
+        """The player's configured strength — for the PLAYER's eval (greens)."""
+        self._set_strength(*self._strength)
 
     def _quit_engine(self) -> None:
         if self._engine is not None:
@@ -160,7 +206,8 @@ class EngineController(QtCore.QThread):
 
     def _analyze(self, board: chess.Board, multipv: int, mode: str, depth: int,
                  player_color: bool | None = None, token: int = 0,
-                 opp_live: bool = False, opp_depth: int = 12, opp_max: int = 22) -> None:
+                 opp_live: bool = False, opp_depth: int = 12, opp_max: int = 22,
+                 limit_strength: bool = False, player_elo: int = 1500) -> None:
         # Tempo model:
         #   * player to move  -> analyse the CURRENT position for the player.
         #   * opponent to move -> look ahead (see _analyze_opponent_turn): the
@@ -168,6 +215,9 @@ class EngineController(QtCore.QThread):
         #     a one-shot preview or refined live over increasing depth.
         # Game over (no legal moves) -> emit empty so the UI shows the result
         # cleanly instead of going silent on an unsearchable position.
+        # The player's eval can be strength-limited (simulated Elo); the opponent
+        # prediction always stays full strength. Applied per-analysis below.
+        self._strength = (bool(limit_strength), int(player_elo))
         if board.legal_moves.count() == 0:
             self.updated.emit([], 0, board, [], token)
             return
@@ -180,6 +230,7 @@ class EngineController(QtCore.QThread):
             return
 
         # Player to move: analyse the real position (streaming live / fixed depth).
+        self._strength_player()
         self._stream_player(board, multipv, mode, depth, [], token)
 
     def _stream_player(self, target_board: chess.Board, multipv: int, mode: str,
@@ -233,6 +284,7 @@ class EngineController(QtCore.QThread):
             for d in schedule:
                 if self._wake.is_set() or self._shutdown:
                     return
+                self._strength_full()                      # opponent prediction: full strength
                 opp = self._top_moves(board, multipv, d)
                 if not opp:
                     self.updated.emit([], 0, board, [], token)
@@ -244,6 +296,7 @@ class EngineController(QtCore.QThread):
                     return
                 if self._wake.is_set() or self._shutdown:
                     return
+                self._strength_player()                    # player's responses: limited
                 responses = self._top_moves(target, multipv, d)
                 self.updated.emit(responses, d, target, opp, token)
             # Candidates settled at the ceiling; now refine the responses deeply on
@@ -251,16 +304,19 @@ class EngineController(QtCore.QThread):
             if not (self._wake.is_set() or self._shutdown) and opp:
                 target = board.copy()
                 target.push(opp[0].move)
+                self._strength_player()
                 self._stream_player(target, multipv, mode, depth, opp, token,
                                     min_emit_depth=schedule[-1])
             return
 
         # Default: one-shot opponent candidates (fast preview), responses streamed
         # (live) or fixed-depth — exactly the prior behaviour.
+        self._strength_full()                              # opponent prediction: full strength
         opp = self._top_moves(board, multipv, opp_depth)
         target = board.copy()
         if opp:
             target.push(opp[0].move)
+        self._strength_player()                            # player's responses: limited
         self._stream_player(target, multipv, mode, depth, opp, token)
 
     def _predictive_turn(self, board: chess.Board, multipv: int, opp_live: bool,
@@ -272,6 +328,7 @@ class EngineController(QtCore.QThread):
         the normal live flow once the opponent actually moves."""
         fixed_opp = None
         if not opp_live:
+            self._strength_full()                                    # opponent candidates: full strength
             fixed_opp = self._top_moves(board, multipv, opp_depth)   # fast preview, then deepen replies
             if not fixed_opp:
                 self.updated.emit([], 0, board, [], token)
@@ -279,10 +336,15 @@ class EngineController(QtCore.QThread):
         for d in self._deepen_schedule(opp_depth, opp_max):
             if self._wake.is_set() or self._shutdown:
                 return
-            opp = fixed_opp if fixed_opp is not None else self._top_moves(board, multipv, d)
+            if fixed_opp is not None:
+                opp = fixed_opp
+            else:
+                self._strength_full()                                # opponent candidates: full strength
+                opp = self._top_moves(board, multipv, d)
             if not opp:
                 self.updated.emit([], 0, board, [], token)
                 return
+            self._strength_player()                                  # player's replies: limited
             responses = self._predictive_replies(board, opp, d)
             if responses is None:                 # interrupted mid-round
                 return
