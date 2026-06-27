@@ -22,7 +22,7 @@ class Config:
     engine_threads: int = 2
     engine_hash_mb: int = 256
     multipv: int = 3                 # number of best moves to show
-    engine_mode: str = "live"        # "live" (streaming, instant) or "fixed" (static depth)
+    engine_mode: str = "live"        # "live" (streaming) | "fixed" (static depth) | "predictive" (reply to each likely opp move)
     analyze_for: str = "auto"        # "auto" (side on bottom) | "white" | "black"
 
     # --- preferences (stable across sessions) ---

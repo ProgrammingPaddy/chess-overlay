@@ -143,8 +143,22 @@ class EngineController(QtCore.QThread):
             self.updated.emit([], 0, board, [], token)
             return
 
+        opponent_to_move = (player_color is not None and board.is_valid()
+                            and board.turn != player_color)
+
+        # Predictive mode (opponent to move): instead of three replies to the
+        # opponent's single best move, show ONE best reply to EACH of the
+        # opponent's top moves — so the player can prepare for every likely move,
+        # not just the most likely one. Once the opponent actually moves it is the
+        # player's turn and execution falls through to the normal multipv flow
+        # below: i.e. it collapses to the same behaviour as live mode. (The live
+        # and fixed modes are untouched.)
+        if mode == "predictive" and opponent_to_move:
+            self._analyze_predictive(board, multipv, player_color, token)
+            return
+
         opp_suggestions, target_board = [], board
-        if player_color is not None and board.is_valid() and board.turn != player_color:
+        if opponent_to_move:
             opp_suggestions = self._top_moves(board, multipv, self.LOOKAHEAD_DEPTH)
             if opp_suggestions:
                 target_board = board.copy()
@@ -175,6 +189,39 @@ class EngineController(QtCore.QThread):
                 if coherent != last_emit:
                     self._emit(latest, coherent, target_board, opp_suggestions, token)
         self._analysis = None
+
+    def _analyze_predictive(self, board: chess.Board, multipv: int,
+                            player_color: bool, token: int) -> None:
+        """Opponent to move, Predictive mode: emit the opponent's top moves (reds)
+        plus the player's single best reply to EACH of them (greens), so the player
+        can prepare for every likely opponent move. Emitted once at the look-ahead
+        depth — the deep, refining analysis happens for real once it is the player's
+        turn (the normal live flow). Reply ``rank`` is paired with its opponent move
+        (reply #1 answers the opponent's best move, #2 their 2nd, ...)."""
+        opp_suggestions = self._top_moves(board, multipv, self.LOOKAHEAD_DEPTH)
+        if not opp_suggestions:
+            self.updated.emit([], 0, board, [], token)
+            return
+        responses = []
+        for rank, opp in enumerate(opp_suggestions, start=1):
+            if self._wake.is_set() or self._shutdown:
+                return                          # a newer position arrived — abandon this one
+            reply_board = board.copy()
+            reply_board.push(opp.move)
+            if reply_board.legal_moves.count() == 0:
+                continue                        # this opponent move ends the game (no reply)
+            best = self._top_moves(reply_board, 1, self.LOOKAHEAD_DEPTH)
+            if best:
+                reply = best[0]
+                reply.rank = rank               # pair the reply with its opponent move
+                responses.append(reply)
+        if self._wake.is_set() or self._shutdown:
+            return
+        # Pass the position after the opponent's best move (turn == player) so the
+        # eval POV and player/opponent colours resolve exactly as the normal flow.
+        target_board = board.copy()
+        target_board.push(opp_suggestions[0].move)
+        self.updated.emit(responses, self.LOOKAHEAD_DEPTH, target_board, opp_suggestions, token)
 
     def _emit(self, latest, depth, board, opp_suggestions, token) -> None:
         out = []

@@ -191,6 +191,7 @@ class MenuWindow(QtWidgets.QWidget):
         self.mode_combo = QtWidgets.QComboBox()
         self.mode_combo.addItem("Live (instant, refines)", "live")
         self.mode_combo.addItem("Fixed depth (strong)", "fixed")
+        self.mode_combo.addItem("Predictive (a reply to each likely move)", "predictive")
         self.mode_combo.setCurrentIndex(max(0, self.mode_combo.findData(self.cfg.engine_mode)))
         ef.addRow("Mode", self.mode_combo)
         self.depth_spin = self._spin(1, 60, self.cfg.engine_depth)
@@ -486,11 +487,14 @@ class MenuWindow(QtWidgets.QWidget):
             else:
                 note = ""
                 if opp_suggestions:
-                    try:
-                        opp_san = self.tracker.board.san(opp_suggestions[0].move)
-                    except Exception:
-                        opp_san = opp_suggestions[0].move.uci()
-                    note = f"  (prep vs their best: {opp_san})"
+                    if self.cfg.engine_mode == "predictive":
+                        note = f"  (a reply to each of their {len(opp_suggestions)} likely moves)"
+                    else:
+                        try:
+                            opp_san = self.tracker.board.san(opp_suggestions[0].move)
+                        except Exception:
+                            opp_san = opp_suggestions[0].move.uci()
+                        note = f"  (prep vs their best: {opp_san})"
                 self.status_label.setText(f"Depth {depth}, {len(suggestions)} line(s).{note}")
         except Exception as exc:
             self.status_label.setText(f"render error: {exc}")
