@@ -136,6 +136,7 @@ class MenuWindow(QtWidgets.QWidget):
         self._refresh_vision_status()
         self._init_controller()
         self._reconcile_orientation_controls()
+        self._sync_strength_controls()
         self._loading = False
 
     # ------------------------------------------------------------------ UI
@@ -143,8 +144,8 @@ class MenuWindow(QtWidgets.QWidget):
         root = QtWidgets.QVBoxLayout(self)
         tabs = QtWidgets.QTabWidget()
         root.addWidget(tabs)
-        tabs.addTab(self._tab_setup(), "Setup")
-        tabs.addTab(self._tab_vision(), "Vision")
+        tabs.addTab(self._tab_vision(), "Board && Vision")
+        tabs.addTab(self._tab_engine(), "Engine")
         tabs.addTab(self._tab_play(), "Play")
 
         self.status_label = QtWidgets.QLabel("Ready. Calibrate the board, then vision.")
@@ -152,7 +153,8 @@ class MenuWindow(QtWidgets.QWidget):
         root.addWidget(self.status_label)
         self._connect_signals()
 
-    def _tab_setup(self) -> QtWidgets.QWidget:
+    def _tab_vision(self) -> QtWidgets.QWidget:
+        """Board calibration + overlay display + piece recognition — all the CV setup."""
         w = QtWidgets.QWidget()
         v = QtWidgets.QVBoxLayout(w)
 
@@ -173,19 +175,52 @@ class MenuWindow(QtWidgets.QWidget):
         self.board_status = QtWidgets.QLabel()
         self.board_status.setWordWrap(True)
         bf.addRow(self.board_status)
-        self.show_border_cb = QtWidgets.QCheckBox("Show calibrated board border")
-        self.show_border_cb.setChecked(self.cfg.show_border)
+        v.addWidget(board)
+
+        overlay = QtWidgets.QGroupBox("Overlay display")
+        ov = QtWidgets.QVBoxLayout(overlay)
         self.show_arrows_cb = QtWidgets.QCheckBox("Show arrows on board")
         self.show_arrows_cb.setChecked(self.cfg.show_arrows)
         self.gold_moves_cb = QtWidgets.QCheckBox("Highlight a clearly-best / mate move in gold")
         self.gold_moves_cb.setChecked(self.cfg.gold_moves)
-        self.white_bottom_cb = QtWidgets.QCheckBox("White on bottom")
-        self.white_bottom_cb.setChecked(self.cfg.white_bottom)
-        bf.addRow(self.show_border_cb)
-        bf.addRow(self.show_arrows_cb)
-        bf.addRow(self.gold_moves_cb)
-        bf.addRow(self.white_bottom_cb)
-        v.addWidget(board)
+        self.show_border_cb = QtWidgets.QCheckBox("Show calibrated board border")
+        self.show_border_cb.setChecked(self.cfg.show_border)
+        for cb in (self.show_arrows_cb, self.gold_moves_cb, self.show_border_cb):
+            ov.addWidget(cb)
+        v.addWidget(overlay)
+
+        vision = QtWidgets.QGroupBox("Piece recognition")
+        vv = QtWidgets.QVBoxLayout(vision)
+        row = QtWidgets.QHBoxLayout()
+        self.calib_vision_btn = QtWidgets.QPushButton("Calibrate vision (start position)")
+        self.calib_vision_btn.setToolTip(
+            "Learn the pieces from the start position AND auto-detect orientation. "
+            "Click again any time the overlay/eval looks wrong to resync.")
+        self.recognize_btn = QtWidgets.QPushButton("Recognize now")
+        row.addWidget(self.calib_vision_btn)
+        row.addWidget(self.recognize_btn)
+        vv.addLayout(row)
+        self.allow_illegal_cb = QtWidgets.QCheckBox(
+            "Allow illegal moves (accept any read, skip legality check)")
+        self.allow_illegal_cb.setChecked(self.cfg.allow_illegal)
+        vv.addWidget(self.allow_illegal_cb)
+        self.certainty_bar = QtWidgets.QProgressBar()
+        self.certainty_bar.setRange(0, 100)
+        self.certainty_bar.setFormat("Read certainty: %p%")
+        vv.addWidget(self.certainty_bar)
+        self.vision_status = QtWidgets.QLabel()
+        self.vision_status.setWordWrap(True)
+        vv.addWidget(self.vision_status)
+        vv.addWidget(QtWidgets.QLabel("What the CV sees:"))
+        self.mini_board = MiniBoard()
+        vv.addWidget(self.mini_board, 1)
+        v.addWidget(vision, 1)
+        return w
+
+    def _tab_engine(self) -> QtWidgets.QWidget:
+        """Engine settings + the player-eval strength limiter."""
+        w = QtWidgets.QWidget()
+        v = QtWidgets.QVBoxLayout(w)
 
         eng = QtWidgets.QGroupBox("Engine")
         ef = QtWidgets.QFormLayout(eng)
@@ -216,32 +251,30 @@ class MenuWindow(QtWidgets.QWidget):
         self.engine_status.setWordWrap(True)
         ef.addRow(self.engine_status)
         v.addWidget(eng)
-        v.addStretch(1)
-        return w
 
-    def _tab_vision(self) -> QtWidgets.QWidget:
-        w = QtWidgets.QWidget()
-        v = QtWidgets.QVBoxLayout(w)
-        row = QtWidgets.QHBoxLayout()
-        self.calib_vision_btn = QtWidgets.QPushButton("Calibrate vision (start position)")
-        self.recognize_btn = QtWidgets.QPushButton("Recognize now")
-        row.addWidget(self.calib_vision_btn)
-        row.addWidget(self.recognize_btn)
-        v.addLayout(row)
-        self.allow_illegal_cb = QtWidgets.QCheckBox(
-            "Allow illegal moves (accept any read, skip legality check)")
-        self.allow_illegal_cb.setChecked(self.cfg.allow_illegal)
-        v.addWidget(self.allow_illegal_cb)
-        self.certainty_bar = QtWidgets.QProgressBar()
-        self.certainty_bar.setRange(0, 100)
-        self.certainty_bar.setFormat("Read certainty: %p%")
-        v.addWidget(self.certainty_bar)
-        self.vision_status = QtWidgets.QLabel()
-        self.vision_status.setWordWrap(True)
-        v.addWidget(self.vision_status)
-        v.addWidget(QtWidgets.QLabel("What the CV sees:"))
-        self.mini_board = MiniBoard()
-        v.addWidget(self.mini_board, 1)
+        strength = QtWidgets.QGroupBox("Player eval strength")
+        sf = QtWidgets.QFormLayout(strength)
+        self.strength_preset = QtWidgets.QComboBox()
+        for text, data in (("Maximum (full strength)", "full"), ("Expert (~2600)", 2600),
+                           ("Advanced (~2200)", 2200), ("Intermediate (~1800)", 1800),
+                           ("Casual (~1500)", 1500), ("Beginner (~1320)", 1320), ("Custom", "custom")):
+            self.strength_preset.addItem(text, data)
+        ef_note = QtWidgets.QLabel(
+            "Caps only YOUR move suggestions (live and fixed). The opponent prediction "
+            "always stays full strength. Default Maximum = unchanged full strength.")
+        ef_note.setWordWrap(True)
+        sf.addRow("Preset", self.strength_preset)
+        self.strength_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.strength_slider.setRange(1320, 3190)
+        self.strength_slider.setSingleStep(20)
+        self.strength_slider.setPageStep(100)
+        self.strength_slider.setValue(self.cfg.player_elo)
+        self.strength_value = QtWidgets.QLabel()
+        sf.addRow("Simulated Elo", self.strength_slider)
+        sf.addRow("", self.strength_value)
+        sf.addRow(ef_note)
+        v.addWidget(strength)
+        v.addStretch(1)
         return w
 
     def _tab_play(self) -> QtWidgets.QWidget:
@@ -249,10 +282,18 @@ class MenuWindow(QtWidgets.QWidget):
         v = QtWidgets.QVBoxLayout(w)
         top = QtWidgets.QFormLayout()
         self.side_combo = QtWidgets.QComboBox()
-        for text, data in (("Auto (side on bottom)", "auto"), ("White", "white"), ("Black", "black")):
+        for text, data in (("Auto-detect (from the board)", "auto"),
+                           ("I'm White (white on bottom)", "white"),
+                           ("I'm Black (black on bottom)", "black")):
             self.side_combo.addItem(text, data)
         self.side_combo.setCurrentIndex(max(0, self.side_combo.findData(self.cfg.analyze_for)))
+        self.side_combo.setToolTip(
+            "Which colour you play. Auto-detect follows the board (recommended); "
+            "if it's ever wrong, click 'Calibrate vision' to re-detect.")
         top.addRow("I play as", self.side_combo)
+        self.orientation_label = QtWidgets.QLabel()
+        self.orientation_label.setWordWrap(True)
+        top.addRow("", self.orientation_label)
         self.track_cb = QtWidgets.QCheckBox("Auto-track game (live board → engine)")
         self.track_cb.setChecked(self.cfg.auto_track)
         top.addRow(self.track_cb)
@@ -263,7 +304,10 @@ class MenuWindow(QtWidgets.QWidget):
         self.pause_drag_cb.setChecked(self.cfg.pause_on_drag)
         top.addRow(self.pause_drag_cb)
         self.turn_label = QtWidgets.QLabel("To move: —")
-        self.flip_turn_btn = QtWidgets.QPushButton("Flip side to move")
+        self.flip_turn_btn = QtWidgets.QPushButton("Flip whose turn it is")
+        self.flip_turn_btn.setToolTip(
+            "Correct whose turn it is if the tracker got it wrong. "
+            "Does NOT change board orientation or your colour.")
         top.addRow(self.turn_label, self.flip_turn_btn)
         v.addLayout(top)
 
@@ -274,7 +318,13 @@ class MenuWindow(QtWidgets.QWidget):
         self.stop_btn = QtWidgets.QPushButton("Stop")
         self.stop_btn.setEnabled(False)
         self.newgame_btn = QtWidgets.QPushButton("New game")
+        self.newgame_btn.setToolTip(
+            "Reset to the starting position and re-detect your colour from the board "
+            "(handles starting a new game as the other colour).")
         self.reset_game_btn = QtWidgets.QPushButton("Re-read board")
+        self.reset_game_btn.setToolTip(
+            "Resync to whatever is on the board right now (mid-game), keeping the "
+            "current orientation.")
         self.snapshot_btn = QtWidgets.QPushButton("Snapshot")
         for b in (self.analyze_btn, self.stop_btn, self.newgame_btn,
                   self.reset_game_btn, self.snapshot_btn):
@@ -311,11 +361,12 @@ class MenuWindow(QtWidgets.QWidget):
         self.reset_game_btn.clicked.connect(self._on_reset_game)
         self.newgame_btn.clicked.connect(self._on_new_game)
         self.flip_turn_btn.clicked.connect(self._on_flip_turn)
-        # Orientation == player colour (side on bottom is the player), so the
-        # 'White on bottom' checkbox and the 'I play as' combo get dedicated
-        # handlers that flip the board AND re-run analysis immediately.
-        self.white_bottom_cb.toggled.connect(self._on_white_bottom_toggled)
+        # 'I play as' is the single orientation/colour control (side on bottom is
+        # the player); it gets a dedicated handler that flips the board AND re-runs
+        # analysis immediately.
         self.side_combo.currentIndexChanged.connect(self._on_side_changed)
+        self.strength_preset.currentIndexChanged.connect(self._on_strength_preset)
+        self.strength_slider.valueChanged.connect(self._on_strength_slider)
         for wdg in (self.show_arrows_cb, self.gold_moves_cb, self.show_border_cb,
                     self.allow_illegal_cb, self.predict_cb, self.pause_drag_cb,
                     self.opp_live_cb):
@@ -373,7 +424,8 @@ class MenuWindow(QtWidgets.QWidget):
         self._controller.request(board, self.cfg.multipv, self.cfg.engine_mode,
                                  self.cfg.engine_depth, self._player_color(), self._req_id,
                                  self.cfg.opp_lookahead_live, self.cfg.opp_lookahead_depth,
-                                 self.cfg.opp_lookahead_max)
+                                 self.cfg.opp_lookahead_max,
+                                 self.cfg.limit_player_strength, self.cfg.player_elo)
         self.stop_btn.setEnabled(True)
 
     def _player_color(self) -> bool:
@@ -403,34 +455,36 @@ class MenuWindow(QtWidgets.QWidget):
         self._start_analysis(board)
 
     # ----------------------------------------------------- orientation / side
-    def _sync_white_bottom_cb(self) -> None:
-        self.white_bottom_cb.blockSignals(True)
-        self.white_bottom_cb.setChecked(self.cfg.white_bottom)
-        self.white_bottom_cb.blockSignals(False)
-
     def _sync_side_combo(self) -> None:
         self.side_combo.blockSignals(True)
         self.side_combo.setCurrentIndex(max(0, self.side_combo.findData(self.cfg.analyze_for)))
         self.side_combo.blockSignals(False)
+
+    def _refresh_orientation_label(self) -> None:
+        """Spell out the effective orientation so 'I play as' is never ambiguous."""
+        side = "White" if self.cfg.white_bottom else "Black"
+        how = "auto-detected" if self.cfg.analyze_for == "auto" else "manual override"
+        self.orientation_label.setText(
+            f"Bottom of board: {side} — you play {side}  ({how}).")
 
     def _apply_orientation(self, white_bottom: bool) -> None:
         """Adopt a board orientation. 'Side on bottom is the player', so this also
         decides which colour the engine analyses for. Re-runs analysis so the
         green/red (player/opponent) split flips immediately, not on the next move."""
         self.cfg.white_bottom = white_bottom
-        self._sync_white_bottom_cb()
         self.cfg.save()
         if self._geometry is not None:
             self._geometry.white_bottom = white_bottom
             self.overlay.set_board_geometry(self._geometry)
         if self._believed is not None:
             self.mini_board.set_board(self._believed, white_bottom)
+        self._refresh_orientation_label()
         self._refresh_turn_label()
         self._reanalyze_current()
 
     def _on_side_changed(self, *_) -> None:
-        """'I play as' — Auto follows the calibrated orientation; White/Black force
-        it (and so flip the board), keeping a single source of truth."""
+        """'I play as' — Auto-detect follows the calibrated orientation; White/Black
+        force it (and so flip the board). The single orientation/colour control."""
         if self._loading:
             return
         data = self.side_combo.currentData()
@@ -443,14 +497,18 @@ class MenuWindow(QtWidgets.QWidget):
             wb = self.vision.white_bottom if self.vision.calibrated else self.cfg.white_bottom
         self._apply_orientation(wb)
 
-    def _on_white_bottom_toggled(self, on: bool) -> None:
-        """Manually flipping the board is an explicit colour choice (you are the
-        side on the bottom), so keep 'I play as' in step with it."""
-        if self._loading:
-            return
-        self.cfg.analyze_for = "white" if on else "black"
+    def _adopt_detected_orientation(self, detected: bool) -> None:
+        """Adopt an auto-detected orientation (from calibration / a new game): set
+        'I play as' back to Auto, sync the board, and refresh the label. Does NOT
+        re-analyze (callers do their own restart)."""
+        self.cfg.analyze_for = "auto"
+        self.cfg.white_bottom = detected
         self._sync_side_combo()
-        self._apply_orientation(on)
+        if self._geometry is not None:
+            self._geometry.white_bottom = detected
+            self.overlay.set_board_geometry(self._geometry)
+        self.cfg.save()
+        self._refresh_orientation_label()
 
     def _reconcile_orientation_controls(self) -> None:
         """At startup make orientation and 'I play as' agree (side on bottom is the
@@ -459,8 +517,63 @@ class MenuWindow(QtWidgets.QWidget):
             self.cfg.white_bottom = True
         elif self.cfg.analyze_for == "black":
             self.cfg.white_bottom = False
-        self._sync_white_bottom_cb()
         self._sync_side_combo()
+        self._refresh_orientation_label()
+
+    # ----------------------------------------------------- player-eval strength
+    @staticmethod
+    def _elo_band(elo: int) -> str:
+        if elo < 1500:
+            return "Beginner"
+        if elo < 1900:
+            return "Intermediate"
+        if elo < 2300:
+            return "Advanced"
+        return "Expert"
+
+    def _strength_text(self) -> str:
+        if not self.cfg.limit_player_strength:
+            return "Full strength (no limit)"
+        return f"Elo {self.cfg.player_elo} · {self._elo_band(self.cfg.player_elo)}"
+
+    def _sync_strength_controls(self) -> None:
+        if not self.cfg.limit_player_strength:
+            idx = self.strength_preset.findData("full")
+        else:
+            idx = self.strength_preset.findData(self.cfg.player_elo)   # exact preset match?
+            if idx < 0:
+                idx = self.strength_preset.findData("custom")
+        self.strength_preset.blockSignals(True)
+        self.strength_preset.setCurrentIndex(max(0, idx))
+        self.strength_preset.blockSignals(False)
+        self.strength_slider.blockSignals(True)
+        self.strength_slider.setValue(self.cfg.player_elo)
+        self.strength_slider.blockSignals(False)
+        self.strength_slider.setEnabled(self.cfg.limit_player_strength)
+        self.strength_value.setText(self._strength_text())
+
+    def _apply_strength(self, limit: bool, elo: int) -> None:
+        self.cfg.limit_player_strength = bool(limit)
+        self.cfg.player_elo = int(elo)
+        self._sync_strength_controls()
+        self.cfg.save()
+        self._reanalyze_current()
+
+    def _on_strength_preset(self, *_) -> None:
+        if self._loading:
+            return
+        data = self.strength_preset.currentData()
+        if data == "full":
+            self._apply_strength(False, self.cfg.player_elo)
+        elif data == "custom":
+            self._apply_strength(True, self.cfg.player_elo)
+        else:
+            self._apply_strength(True, int(data))
+
+    def _on_strength_slider(self, value: int) -> None:
+        if self._loading:
+            return
+        self._apply_strength(True, value)   # the slider is only enabled while limiting
 
     def _refresh_board_status(self) -> None:
         if self._cap_region is None:
@@ -534,8 +647,8 @@ class MenuWindow(QtWidgets.QWidget):
     def _on_settings_changed(self, *_) -> None:
         if self._loading:
             return
-        # Orientation / player colour are owned by the dedicated handlers
-        # (_on_side_changed / _on_white_bottom_toggled), not read here.
+        # Orientation / player colour and strength are owned by dedicated handlers
+        # (_on_side_changed / _on_strength_*), not read here.
         before = (self.cfg.multipv, self.cfg.engine_depth, self.cfg.engine_mode,
                   self.cfg.gold_moves, self.cfg.show_predicted, self.cfg.opp_lookahead_live,
                   self.cfg.opp_lookahead_depth, self.cfg.opp_lookahead_max)
@@ -665,14 +778,7 @@ class MenuWindow(QtWidgets.QWidget):
         note = ""
         if detected != self.cfg.white_bottom:
             note = f" (auto-detected {'White' if detected else 'Black'} on the bottom)"
-        self.cfg.analyze_for = "auto"
-        self._sync_side_combo()
-        self.cfg.white_bottom = detected
-        self._sync_white_bottom_cb()
-        self.cfg.save()
-        if self._geometry is not None:
-            self._geometry.white_bottom = detected
-            self.overlay.set_board_geometry(self._geometry)
+        self._adopt_detected_orientation(detected)
         dump_calibration(DEBUG_DIR, img, self.vision)
         self._refresh_vision_status()
         self._set_track_checkbox(True)
@@ -874,14 +980,7 @@ class MenuWindow(QtWidgets.QWidget):
         detected = trial.white_bottom
         flipped = detected != self.cfg.white_bottom
         if flipped:
-            self.cfg.analyze_for = "auto"
-            self._sync_side_combo()
-            self.cfg.white_bottom = detected
-            self._sync_white_bottom_cb()
-            if self._geometry is not None:
-                self._geometry.white_bottom = detected
-                self.overlay.set_board_geometry(self._geometry)
-            self.cfg.save()
+            self._adopt_detected_orientation(detected)
         self._refresh_vision_status()
         if self._vision_worker is not None:        # rebuild the worker on the new model
             self._start_tracking()
@@ -907,16 +1006,20 @@ class MenuWindow(QtWidgets.QWidget):
         self.status_label.setText("Re-read the board." + note)
 
     def _on_new_game(self) -> None:
-        # Clean reset to a fresh game from move 1. If a start position is on screen,
-        # recalibrate to it first so a colour/theme change carries over cleanly.
+        # Clean reset to a fresh game from move 1. A new game may have flipped your
+        # colour, so return 'I play as' to Auto-detect and re-detect orientation
+        # from the live start position before reseeding.
         if self._controller is not None:
             self._controller.clear()
+        self.cfg.analyze_for = "auto"
+        self._sync_side_combo()
         note = self._recalibrate_to_live(require_start=True)
         self._reset_tracking_state()
         self.tracker.reset()                       # start position, White to move
         self.overlay.clear()
         self.results_list.clear()
         self._after_commit()
+        self._refresh_orientation_label()
         self.status_label.setText("New game — start position." + note)
 
     def _refresh_moves(self) -> None:
