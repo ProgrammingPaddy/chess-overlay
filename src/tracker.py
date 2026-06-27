@@ -79,9 +79,13 @@ class GameTracker:
         """Manually pin whose turn it is (the 'flip side to move' button).
 
         Rebuilds from the current placement so the move history can't become
-        inconsistent with the new side to move (which could crash SAN replay)."""
+        inconsistent with the new side to move (which could crash SAN replay), but
+        RE-INFERS castling rights so a turn flip doesn't silently drop them (the
+        engine needs correct rights; legality of castling in/through check is then
+        enforced by python-chess on the valid position)."""
         placement = self.board.board_fen()
         self.board = chess.Board(f"{placement} {'w' if white_to_move else 'b'} - - 0 1")
+        self._infer_castling()
         self._base = self.board.copy()
         self.turn_known = True
 

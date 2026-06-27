@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import Callable
 
+import numpy as np
 from PySide6 import QtCore
 
 from src.capture import ScreenCapture
@@ -28,15 +29,27 @@ class VisionWorker(QtCore.QThread):
 
     def run(self) -> None:
         capture = ScreenCapture()
+        last_img = last_board = last_debug = None
         try:
             while not self._stop:
                 region = self._region_fn()
                 if region is None or not self._vision.calibrated:
+                    last_img = None
                     self.msleep(80)
                     continue
                 try:
                     img = capture.grab(*region)
-                    board, debug = self._vision.analyze(img, self._orient_fn())
+                    # Skip the (expensive) per-square recognition when the captured
+                    # board is byte-identical to the last frame — the result is
+                    # provably the same, so reuse it. array_equal short-circuits on
+                    # the first differing pixel, so a real move costs ~nothing; this
+                    # just avoids re-recognising a still board ~20x/second.
+                    if (last_img is not None and img.shape == last_img.shape
+                            and np.array_equal(img, last_img)):
+                        board, debug = last_board, last_debug
+                    else:
+                        board, debug = self._vision.analyze(img, self._orient_fn())
+                        last_img, last_board, last_debug = img, board, debug
                     self.frame.emit(board, debug)
                 except Exception:
                     pass

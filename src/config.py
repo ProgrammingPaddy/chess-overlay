@@ -34,6 +34,7 @@ class Config:
     allow_illegal: bool = False      # accept recognized positions even if not a legal move
     show_predicted: bool = True      # show the opponent's best move (red) on their turn
     pause_on_drag: bool = True       # freeze the eval while a piece is held on the board
+    auto_track: bool = True          # auto-track the live board (engine analysis on by default)
 
     @classmethod
     def load(cls) -> "Config":

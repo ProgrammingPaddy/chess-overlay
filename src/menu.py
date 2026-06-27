@@ -241,7 +241,8 @@ class MenuWindow(QtWidgets.QWidget):
             self.side_combo.addItem(text, data)
         self.side_combo.setCurrentIndex(max(0, self.side_combo.findData(self.cfg.analyze_for)))
         top.addRow("I play as", self.side_combo)
-        self.track_cb = QtWidgets.QCheckBox("Auto-track game")
+        self.track_cb = QtWidgets.QCheckBox("Auto-track game (live board → engine)")
+        self.track_cb.setChecked(self.cfg.auto_track)
         top.addRow(self.track_cb)
         self.predict_cb = QtWidgets.QCheckBox("Show opponent's likely moves (red) on their turn")
         self.predict_cb.setChecked(self.cfg.show_predicted)
@@ -257,12 +258,14 @@ class MenuWindow(QtWidgets.QWidget):
         self.fen_edit = QtWidgets.QLineEdit(chess.STARTING_FEN)
         v.addWidget(self.fen_edit)
         row = QtWidgets.QHBoxLayout()
-        self.analyze_btn = QtWidgets.QPushButton("Analyze")
+        self.analyze_btn = QtWidgets.QPushButton("Analyze FEN")
         self.stop_btn = QtWidgets.QPushButton("Stop")
         self.stop_btn.setEnabled(False)
+        self.newgame_btn = QtWidgets.QPushButton("New game")
+        self.reset_game_btn = QtWidgets.QPushButton("Re-read board")
         self.snapshot_btn = QtWidgets.QPushButton("Snapshot")
-        self.reset_game_btn = QtWidgets.QPushButton("Reset game")
-        for b in (self.analyze_btn, self.stop_btn, self.snapshot_btn, self.reset_game_btn):
+        for b in (self.analyze_btn, self.stop_btn, self.newgame_btn,
+                  self.reset_game_btn, self.snapshot_btn):
             row.addWidget(b)
         v.addLayout(row)
         self.results_list = QtWidgets.QListWidget()
@@ -294,6 +297,7 @@ class MenuWindow(QtWidgets.QWidget):
         self.recognize_btn.clicked.connect(self._on_recognize)
         self.track_cb.toggled.connect(self._on_track_toggled)
         self.reset_game_btn.clicked.connect(self._on_reset_game)
+        self.newgame_btn.clicked.connect(self._on_new_game)
         self.flip_turn_btn.clicked.connect(self._on_flip_turn)
         for wdg in (self.show_arrows_cb, self.gold_moves_cb, self.show_border_cb,
                     self.white_bottom_cb, self.allow_illegal_cb, self.predict_cb,
@@ -516,8 +520,16 @@ class MenuWindow(QtWidgets.QWidget):
         except ValueError:
             self.status_label.setText("Invalid FEN.")
             return
+        # Manual analysis: pause auto-track so the typed position isn't instantly
+        # overwritten by the live board.
+        if self._vision_worker is not None:
+            self._stop_tracking()
+            self._set_track_checkbox(False)
+            self.cfg.auto_track = False
+            self.cfg.save()
         self._believed = board
         self._start_analysis(board)
+        self.status_label.setText("Analyzing the typed FEN (auto-track paused).")
 
     def _on_stop(self) -> None:
         self._stop_analysis()
@@ -627,11 +639,15 @@ class MenuWindow(QtWidgets.QWidget):
     def _on_track_toggled(self, on: bool) -> None:
         if self._loading:
             return
+        self.cfg.auto_track = on
+        self.cfg.save()
         if on:
             if self._start_tracking():
                 self.status_label.setText("Auto-tracking on.")
             else:
                 self._set_track_checkbox(False)
+                self.cfg.auto_track = False
+                self.cfg.save()
         else:
             self._stop_tracking()
             self.status_label.setText("Auto-tracking off.")
@@ -721,8 +737,10 @@ class MenuWindow(QtWidgets.QWidget):
         self.overlay.set_annotations(visible_annotations(self._believed, self._suggestions))
 
     def _on_reset_game(self) -> None:
-        # Blank slate: forget history, re-seed the baseline from whatever is on
-        # the board right now (a brand-new, unrelated position).
+        # Re-read the live board fresh: drop history/state, reseed from whatever is
+        # on screen right now, and restart analysis cleanly.
+        if self._controller is not None:
+            self._controller.clear()
         self._reset_tracking_state()
         observed = None
         if self.vision.calibrated:
@@ -733,6 +751,18 @@ class MenuWindow(QtWidgets.QWidget):
         self.overlay.clear()
         self.results_list.clear()
         self._after_commit()
+        self.status_label.setText("Re-read the board.")
+
+    def _on_new_game(self) -> None:
+        # Clean reset to the start position (a fresh game from move 1).
+        if self._controller is not None:
+            self._controller.clear()
+        self._reset_tracking_state()
+        self.tracker.reset()                       # start position, White to move
+        self.overlay.clear()
+        self.results_list.clear()
+        self._after_commit()
+        self.status_label.setText("New game — start position.")
 
     def _refresh_moves(self) -> None:
         self.moves_view.setPlainText(self.tracker.san_line())
