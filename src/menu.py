@@ -200,6 +200,15 @@ class MenuWindow(QtWidgets.QWidget):
         self.hash_spin = self._spin(16, 8192, self.cfg.engine_hash_mb, step=64)
         ef.addRow("Depth (fixed)", self.depth_spin)
         ef.addRow("Lines", self.lines_spin)
+        # Opponent look-ahead (live & predictive modes): a fast one-shot preview by
+        # default, or refine it live from the preview depth up to the ceiling.
+        self.opp_live_cb = QtWidgets.QCheckBox("Refine opponent look-ahead live (deepen over time)")
+        self.opp_live_cb.setChecked(self.cfg.opp_lookahead_live)
+        self.opp_depth_spin = self._spin(2, 40, self.cfg.opp_lookahead_depth)
+        self.opp_max_spin = self._spin(2, 60, self.cfg.opp_lookahead_max)
+        ef.addRow("Opponent look-ahead", self.opp_live_cb)
+        ef.addRow("Opp preview depth", self.opp_depth_spin)
+        ef.addRow("Opp refine ceiling", self.opp_max_spin)
         ef.addRow("Threads", self.threads_spin)
         ef.addRow("Hash (MB)", self.hash_spin)
         self.engine_status = QtWidgets.QLabel("Engine: starting…")
@@ -307,11 +316,13 @@ class MenuWindow(QtWidgets.QWidget):
         self.white_bottom_cb.toggled.connect(self._on_white_bottom_toggled)
         self.side_combo.currentIndexChanged.connect(self._on_side_changed)
         for wdg in (self.show_arrows_cb, self.gold_moves_cb, self.show_border_cb,
-                    self.allow_illegal_cb, self.predict_cb, self.pause_drag_cb):
+                    self.allow_illegal_cb, self.predict_cb, self.pause_drag_cb,
+                    self.opp_live_cb):
             wdg.toggled.connect(self._on_settings_changed)
         for cb in (self.monitor_combo, self.mode_combo):
             cb.currentIndexChanged.connect(self._on_settings_changed)
-        for sp in (self.depth_spin, self.lines_spin, self.threads_spin, self.hash_spin):
+        for sp in (self.depth_spin, self.lines_spin, self.threads_spin, self.hash_spin,
+                   self.opp_depth_spin, self.opp_max_spin):
             sp.valueChanged.connect(self._on_settings_changed)
 
     # ---------------------------------------------------------------- helpers
@@ -359,7 +370,9 @@ class MenuWindow(QtWidgets.QWidget):
         self._analyzing_key = self._pos_key(board)
         self._req_id += 1
         self._controller.request(board, self.cfg.multipv, self.cfg.engine_mode,
-                                 self.cfg.engine_depth, self._player_color(), self._req_id)
+                                 self.cfg.engine_depth, self._player_color(), self._req_id,
+                                 self.cfg.opp_lookahead_live, self.cfg.opp_lookahead_depth,
+                                 self.cfg.opp_lookahead_max)
         self.stop_btn.setEnabled(True)
 
     def _player_color(self) -> bool:
@@ -523,7 +536,8 @@ class MenuWindow(QtWidgets.QWidget):
         # Orientation / player colour are owned by the dedicated handlers
         # (_on_side_changed / _on_white_bottom_toggled), not read here.
         before = (self.cfg.multipv, self.cfg.engine_depth, self.cfg.engine_mode,
-                  self.cfg.gold_moves, self.cfg.show_predicted)
+                  self.cfg.gold_moves, self.cfg.show_predicted, self.cfg.opp_lookahead_live,
+                  self.cfg.opp_lookahead_depth, self.cfg.opp_lookahead_max)
         self.cfg.engine_depth = self.depth_spin.value()
         self.cfg.multipv = self.lines_spin.value()
         self.cfg.engine_threads = self.threads_spin.value()
@@ -536,6 +550,9 @@ class MenuWindow(QtWidgets.QWidget):
         self.cfg.allow_illegal = self.allow_illegal_cb.isChecked()
         self.cfg.show_predicted = self.predict_cb.isChecked()
         self.cfg.pause_on_drag = self.pause_drag_cb.isChecked()
+        self.cfg.opp_lookahead_live = self.opp_live_cb.isChecked()
+        self.cfg.opp_lookahead_depth = self.opp_depth_spin.value()
+        self.cfg.opp_lookahead_max = self.opp_max_spin.value()
         self.cfg.save()
         self.overlay.set_overlay_visible(self.cfg.show_arrows)
         self.overlay.set_show_border(self.cfg.show_border)
@@ -544,10 +561,11 @@ class MenuWindow(QtWidgets.QWidget):
             self._eng_sig = sig
             self._controller.reconfigure(*sig)
         # A change that affects the engine output or the arrows (lines, depth,
-        # mode, gold, opponent-reds) re-runs analysis so the toggle takes effect
-        # now instead of only on the next move.
+        # mode, gold, opponent-reds, opponent look-ahead) re-runs analysis so the
+        # change takes effect now instead of only on the next move.
         after = (self.cfg.multipv, self.cfg.engine_depth, self.cfg.engine_mode,
-                 self.cfg.gold_moves, self.cfg.show_predicted)
+                 self.cfg.gold_moves, self.cfg.show_predicted, self.cfg.opp_lookahead_live,
+                 self.cfg.opp_lookahead_depth, self.cfg.opp_lookahead_max)
         if after != before:
             self._reanalyze_current()
 

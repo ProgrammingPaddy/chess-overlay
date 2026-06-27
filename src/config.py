@@ -24,6 +24,13 @@ class Config:
     multipv: int = 3                 # number of best moves to show
     engine_mode: str = "live"        # "live" (streaming) | "fixed" (static depth) | "predictive" (reply to each likely opp move)
     analyze_for: str = "auto"        # "auto" (side on bottom) | "white" | "black"
+    # Opponent look-ahead (live & predictive modes): a one-shot preview at
+    # opp_lookahead_depth by default; when opp_lookahead_live is on it refines from
+    # that depth up to opp_lookahead_max over time. Predictive ALWAYS refines its
+    # per-move replies regardless of the toggle.
+    opp_lookahead_live: bool = False
+    opp_lookahead_depth: int = 12    # one-shot / preview depth (also the live-refine start)
+    opp_lookahead_max: int = 22      # live-refine ceiling
 
     # --- preferences (stable across sessions) ---
     board_monitor: int = 0
