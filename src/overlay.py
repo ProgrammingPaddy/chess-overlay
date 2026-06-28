@@ -157,11 +157,34 @@ class Annotation:
     player_is_white: bool = True   # which colour the player is -> green/grey is player-POV
 
 
+def _styled_set_policy(suggestions, opponent: bool, flip: bool, gold: bool,
+                       player_is_white: bool) -> list["Annotation"]:
+    """Policy engines (Maia 2): opacity = human-move likelihood relative to the
+    most-likely move, label = that probability. The green/grey/red colour still
+    comes from the position win probability (already mapped into ``score_cp``)."""
+    pols = [float(s.policy or 0.0) for s in suggestions]
+    mx = max(pols) if pols else 0.0
+    golds = {pols.index(mx): 1.0} if (gold and mx >= 0.5) else {}   # a clearly dominant human move
+    out = []
+    for i, s in enumerate(suggestions):
+        abs_cp = (-s.score_cp if (flip and s.score_cp is not None) else s.score_cp)
+        dom = i in golds
+        strength = (pols[i] / mx) if mx > 0 else 0.0
+        out.append(Annotation(move=s.move, rank=s.rank, opponent=opponent,
+                              label=f"{pols[i] * 100:.0f}%", score_cp=abs_cp, mate=None,
+                              strength=(1.0 if dom else strength), gold=dom,
+                              player_is_white=player_is_white))
+    return out
+
+
 def _styled_set(suggestions, opponent: bool, flip: bool, gold: bool,
-                player_is_white: bool) -> list["Annotation"]:
+                player_is_white: bool, policy_mode: bool = False) -> list["Annotation"]:
     """Annotations for one side: relative opacity within the set + a dominant flag,
     eval shown ABSOLUTE (+ White, - Black). ``flip`` negates the side-to-move score;
-    ``player_is_white`` lets the green/grey colour track the PLAYER's POV."""
+    ``player_is_white`` lets the green/grey colour track the PLAYER's POV.
+    ``policy_mode`` switches to human-likelihood opacity + probability labels."""
+    if policy_mode:
+        return _styled_set_policy(suggestions, opponent, flip, gold, player_is_white)
     strengths = _relative_strengths(suggestions)
     golds = _gold_strengths(suggestions) if gold else {}
     out = []
@@ -177,7 +200,8 @@ def _styled_set(suggestions, opponent: bool, flip: bool, gold: bool,
 
 
 def build_annotations(suggestions, opp_suggestions=None, show_opponent=True,
-                      white_to_move=True, gold_enabled=True) -> list["Annotation"]:
+                      white_to_move=True, gold_enabled=True,
+                      policy_mode=False) -> list["Annotation"]:
     """Turn engine output into arrows under the fixed tempo model:
 
       * the player's moves — GOLD when a forced mate or clearly best (>= ~1 pawn),
@@ -195,9 +219,11 @@ def build_annotations(suggestions, opp_suggestions=None, show_opponent=True,
     anns: list[Annotation] = []
     if opp_suggestions and show_opponent:
         anns += _styled_set(opp_suggestions, opponent=True, flip=white_to_move,
-                            gold=gold_enabled, player_is_white=player_is_white)
+                            gold=gold_enabled, player_is_white=player_is_white,
+                            policy_mode=policy_mode)
     anns += _styled_set(suggestions, opponent=False, flip=not white_to_move,
-                        gold=gold_enabled, player_is_white=player_is_white)
+                        gold=gold_enabled, player_is_white=player_is_white,
+                        policy_mode=policy_mode)
     return anns
 
 

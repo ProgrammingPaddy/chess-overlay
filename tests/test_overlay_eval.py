@@ -17,7 +17,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import chess
-from src.engine import MoveSuggestion
+from src.engine import MoveSuggestion, win_prob_to_cp
 from src.overlay import (DARK_RED, GOLD, GREEN, GREY, RED, _arrow_color,
                          _eval_text_color, build_annotations)
 
@@ -108,6 +108,34 @@ opp_dom = [x for x in anns if x.opponent and x.gold]
 check("overwhelming opponent move -> dark red", bool(opp_dom)
       and rgb(_arrow_color(opp_dom[0])) == DARK_RED,
       rgb(_arrow_color(opp_dom[0])) if opp_dom else "no gold opp")
+
+# --- policy mode (Maia 2): opacity = human likelihood, label = probability --------
+def psug(uci, policy, win_prob, rank):
+    return MoveSuggestion(chess.Move.from_uci(uci), win_prob_to_cp(win_prob), None,
+                          rank=rank, win_prob=win_prob, policy=policy)
+
+# player is White, slightly winning (win_prob 0.6); 3 human moves of decreasing odds
+pol = [psug("e2e4", 0.45, 0.6, 1), psug("d2d4", 0.3, 0.6, 2), psug("g1f3", 0.1, 0.6, 3)]
+anns = build_annotations(pol, None, show_opponent=False, white_to_move=True,
+                         gold_enabled=True, policy_mode=True)
+check("policy labels are percentages", all(a.label.endswith("%") for a in anns),
+      str([a.label for a in anns]))
+check("top human move labelled 45%", anns[0].label == "45%")
+check("most-likely human move is fully opaque", anns[0].strength == 1.0)
+check("opacity scales with human likelihood", anns[1].strength < anns[0].strength)
+check("policy arrow green when the player is winning (no dominant move)",
+      rgb(_arrow_color(anns[0])) == GREEN, rgb(_arrow_color(anns[0])))
+
+# a clearly dominant human move (>=50%) goes gold
+dom = build_annotations([psug("e2e4", 0.7, 0.6, 1), psug("d2d4", 0.1, 0.6, 2)], None,
+                        show_opponent=False, white_to_move=True, gold_enabled=True, policy_mode=True)
+check("dominant human move (>=50%) is gold", rgb(_arrow_color(dom[0])) == GOLD)
+
+# Black player in a losing line: win_prob 0.3 (side-to-move = Black) -> grey
+pol_b = build_annotations([psug("e7e5", 0.4, 0.3, 1)], None, show_opponent=False,
+                          white_to_move=False, gold_enabled=True, policy_mode=True)
+check("policy arrow grey when the player is worse", rgb(_arrow_color(pol_b[0])) == GREY,
+      rgb(_arrow_color(pol_b[0])))
 
 print(f"\n{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)

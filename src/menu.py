@@ -15,6 +15,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from src.analysis import EngineController
 from src.calibrate import auto_calibrate, calibrate
+from src.engine_profiles import PROFILES, make_controller
 from src.capture import ScreenCapture, save_image
 from src.config import Config
 from src.consensus import ConsensusBuffer
@@ -140,6 +141,8 @@ class MenuWindow(QtWidgets.QWidget):
         self.overlay.set_show_border(self.cfg.show_border)
         self._refresh_board_status()
         self._refresh_vision_status()
+        self._apply_engine_profile()
+        self._sync_maia_controls()
         self._init_controller()
         self._reconcile_orientation_controls()
         self._sync_strength_controls()
@@ -224,26 +227,42 @@ class MenuWindow(QtWidgets.QWidget):
         return w
 
     def _tab_engine(self) -> QtWidgets.QWidget:
-        """Engine settings + the player-eval strength limiter."""
+        """Engine selection + the option profile (per-engine groups) for it."""
+        from src.engine_profiles import ENGINE_ORDER, PROFILES, leela_networks
         w = QtWidgets.QWidget()
         v = QtWidgets.QVBoxLayout(w)
 
-        eng = QtWidgets.QGroupBox("Engine")
-        ef = QtWidgets.QFormLayout(eng)
+        # --- engine selector + always-shown controls ---
+        sel = QtWidgets.QGroupBox("Engine")
+        slf = QtWidgets.QFormLayout(sel)
+        self.engine_combo = QtWidgets.QComboBox()
+        for key in ENGINE_ORDER:
+            self.engine_combo.addItem(PROFILES[key].label, key)
+        self.engine_combo.setCurrentIndex(max(0, self.engine_combo.findData(self.cfg.engine)))
+        slf.addRow("Engine", self.engine_combo)
+        self.engine_blurb = QtWidgets.QLabel()
+        self.engine_blurb.setWordWrap(True)
+        slf.addRow(self.engine_blurb)
         self.mode_combo = QtWidgets.QComboBox()
         self.mode_combo.addItem("Live (instant, refines)", "live")
         self.mode_combo.addItem("Fixed depth (strong)", "fixed")
         self.mode_combo.addItem("Predictive (a reply to each likely move)", "predictive")
         self.mode_combo.setCurrentIndex(max(0, self.mode_combo.findData(self.cfg.engine_mode)))
-        ef.addRow("Mode", self.mode_combo)
-        self.depth_spin = self._spin(1, 60, self.cfg.engine_depth)
+        slf.addRow("Mode", self.mode_combo)
         self.lines_spin = self._spin(1, 5, self.cfg.multipv)
+        slf.addRow("Lines", self.lines_spin)
+        self.engine_status = QtWidgets.QLabel("Engine: starting…")
+        self.engine_status.setWordWrap(True)
+        slf.addRow(self.engine_status)
+        v.addWidget(sel)
+
+        # --- search resources (Stockfish / Leela) ---
+        self.search_group = QtWidgets.QGroupBox("Search")
+        ef = QtWidgets.QFormLayout(self.search_group)
+        self.depth_spin = self._spin(1, 60, self.cfg.engine_depth)
         self.threads_spin = self._spin(1, max(1, os.cpu_count() or 1), self.cfg.engine_threads)
         self.hash_spin = self._spin(16, 8192, self.cfg.engine_hash_mb, step=64)
         ef.addRow("Depth (fixed)", self.depth_spin)
-        ef.addRow("Lines", self.lines_spin)
-        # Opponent look-ahead (live & predictive modes): a fast one-shot preview by
-        # default, or refine it live from the preview depth up to the ceiling.
         self.opp_live_cb = QtWidgets.QCheckBox("Refine opponent look-ahead live (deepen over time)")
         self.opp_live_cb.setChecked(self.cfg.opp_lookahead_live)
         self.opp_depth_spin = self._spin(2, 40, self.cfg.opp_lookahead_depth)
@@ -253,22 +272,16 @@ class MenuWindow(QtWidgets.QWidget):
         ef.addRow("Opp refine ceiling", self.opp_max_spin)
         ef.addRow("Threads", self.threads_spin)
         ef.addRow("Hash (MB)", self.hash_spin)
-        self.engine_status = QtWidgets.QLabel("Engine: starting…")
-        self.engine_status.setWordWrap(True)
-        ef.addRow(self.engine_status)
-        v.addWidget(eng)
+        v.addWidget(self.search_group)
 
-        strength = QtWidgets.QGroupBox("Player eval strength")
-        sf = QtWidgets.QFormLayout(strength)
+        # --- Stockfish strength limiter (simulated Elo) ---
+        self.strength_group = QtWidgets.QGroupBox("Player eval strength")
+        sf = QtWidgets.QFormLayout(self.strength_group)
         self.strength_preset = QtWidgets.QComboBox()
         for text, data in (("Maximum (full strength)", "full"), ("Expert (~2600)", 2600),
                            ("Advanced (~2200)", 2200), ("Intermediate (~1800)", 1800),
                            ("Casual (~1500)", 1500), ("Beginner (~1320)", 1320), ("Custom", "custom")):
             self.strength_preset.addItem(text, data)
-        ef_note = QtWidgets.QLabel(
-            "Caps only YOUR move suggestions (live and fixed). The opponent prediction "
-            "always stays full strength. Default Maximum = unchanged full strength.")
-        ef_note.setWordWrap(True)
         sf.addRow("Preset", self.strength_preset)
         self.strength_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
         self.strength_slider.setRange(1320, 3190)
@@ -278,8 +291,56 @@ class MenuWindow(QtWidgets.QWidget):
         self.strength_value = QtWidgets.QLabel()
         sf.addRow("Simulated Elo", self.strength_slider)
         sf.addRow("", self.strength_value)
-        sf.addRow(ef_note)
-        v.addWidget(strength)
+        sf_note = QtWidgets.QLabel("Caps only YOUR suggestions; the opponent prediction stays full strength.")
+        sf_note.setWordWrap(True)
+        sf.addRow(sf_note)
+        v.addWidget(self.strength_group)
+
+        # --- Leela network (its strength/style control) ---
+        self.leela_group = QtWidgets.QGroupBox("Leela network")
+        lf = QtWidgets.QFormLayout(self.leela_group)
+        self.leela_net_combo = QtWidgets.QComboBox()
+        for label, path in leela_networks():
+            self.leela_net_combo.addItem(label, path)
+        if self.cfg.leela_network:
+            i = self.leela_net_combo.findData(self.cfg.leela_network)
+            if i >= 0:
+                self.leela_net_combo.setCurrentIndex(i)
+        lf.addRow("Network", self.leela_net_combo)
+        l_note = QtWidgets.QLabel("A strong general net, or a Maia rating net for human-like play.")
+        l_note.setWordWrap(True)
+        lf.addRow(l_note)
+        v.addWidget(self.leela_group)
+
+        # --- Maia 2 (human Elo) ---
+        self.maia_group = QtWidgets.QGroupBox("Maia 2 — human strength")
+        mf = QtWidgets.QFormLayout(self.maia_group)
+        self.player_elo_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.player_elo_slider.setRange(1100, 2000)
+        self.player_elo_slider.setSingleStep(50)
+        self.player_elo_slider.setPageStep(100)
+        self.player_elo_slider.setValue(min(2000, max(1100, self.cfg.maia_player_elo)))
+        self.player_elo_value = QtWidgets.QLabel()
+        self.opp_elo_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.opp_elo_slider.setRange(1100, 2000)
+        self.opp_elo_slider.setSingleStep(50)
+        self.opp_elo_slider.setPageStep(100)
+        self.opp_elo_slider.setValue(min(2000, max(1100, self.cfg.maia_opp_elo)))
+        self.opp_elo_value = QtWidgets.QLabel()
+        self.maia_model_combo = QtWidgets.QComboBox()
+        self.maia_model_combo.addItem("Rapid", "rapid")
+        self.maia_model_combo.addItem("Blitz", "blitz")
+        self.maia_model_combo.setCurrentIndex(max(0, self.maia_model_combo.findData(self.cfg.maia_model)))
+        mf.addRow("Your Elo", self.player_elo_slider)
+        mf.addRow("", self.player_elo_value)
+        mf.addRow("Opponent Elo", self.opp_elo_slider)
+        mf.addRow("", self.opp_elo_value)
+        mf.addRow("Model", self.maia_model_combo)
+        m_note = QtWidgets.QLabel("Shows the moves a human of your Elo would likely play (probabilities, no search).")
+        m_note.setWordWrap(True)
+        mf.addRow(m_note)
+        v.addWidget(self.maia_group)
+
         v.addStretch(1)
         return w
 
@@ -373,6 +434,12 @@ class MenuWindow(QtWidgets.QWidget):
         self.side_combo.currentIndexChanged.connect(self._on_side_changed)
         self.strength_preset.currentIndexChanged.connect(self._on_strength_preset)
         self.strength_slider.valueChanged.connect(self._on_strength_slider)
+        # Engine selection + per-engine option controls.
+        self.engine_combo.currentIndexChanged.connect(self._on_engine_changed)
+        self.leela_net_combo.currentIndexChanged.connect(self._on_leela_net_changed)
+        self.maia_model_combo.currentIndexChanged.connect(self._on_maia_model_changed)
+        self.player_elo_slider.valueChanged.connect(self._on_maia_elo_changed)
+        self.opp_elo_slider.valueChanged.connect(self._on_maia_elo_changed)
         for wdg in (self.show_arrows_cb, self.gold_moves_cb, self.show_border_cb,
                     self.allow_illegal_cb, self.predict_cb, self.pause_drag_cb,
                     self.opp_live_cb):
@@ -399,16 +466,85 @@ class MenuWindow(QtWidgets.QWidget):
         return self._ensure_capture().grab(*self._cap_region)
 
     def _init_controller(self) -> None:
-        path = self.cfg.engine_path or find_stockfish()
-        if not path:
-            self.engine_status.setText("Engine: Stockfish not found (put it in engines/).")
+        self._start_engine()
+
+    def _start_engine(self) -> None:
+        """(Re)build the controller for the configured engine. All engines expose the
+        same updated/failed/ready + request interface, so the rest of the app is
+        engine-agnostic. Tears down any existing controller first."""
+        if self._controller is not None:
+            try:
+                self._controller.clear()
+                self._controller.shutdown()
+            except Exception:
+                pass
+            self._controller = None
+        label = PROFILES.get(self.cfg.engine, PROFILES["stockfish"]).label
+        ctrl, err = make_controller(self.cfg)
+        if ctrl is None:
+            self.engine_status.setText(f"{label}: {err}")
             return
-        c = EngineController(path, self.cfg.engine_threads, self.cfg.engine_hash_mb)
-        c.updated.connect(self._on_analysis_updated)
-        c.failed.connect(self._on_analysis_failed)
-        c.ready.connect(lambda: self.engine_status.setText(f"Engine: {Path(path).name} ready."))
-        c.start()
-        self._controller = c
+        ctrl.updated.connect(self._on_analysis_updated)
+        ctrl.failed.connect(self._on_analysis_failed)
+        ctrl.ready.connect(lambda lbl=label: self.engine_status.setText(f"{lbl}: ready."))
+        ctrl.start()
+        self._controller = ctrl
+        self._eng_sig = (self.cfg.engine_threads, self.cfg.engine_hash_mb)
+        self.engine_status.setText(f"{label}: starting…")
+
+    def _apply_engine_profile(self) -> None:
+        """Show only the option groups the active engine uses (its menu profile)."""
+        prof = PROFILES.get(self.cfg.engine, PROFILES["stockfish"])
+        f = prof.features
+        self.engine_blurb.setText(prof.blurb)
+        self.search_group.setVisible("depth" in f)
+        self.strength_group.setVisible("strength_elo" in f)
+        self.leela_group.setVisible("leela_network" in f)
+        self.maia_group.setVisible("player_elo" in f)
+
+    def _sync_maia_controls(self) -> None:
+        self.player_elo_value.setText(f"Elo {self.cfg.maia_player_elo}")
+        self.opp_elo_value.setText(f"Elo {self.cfg.maia_opp_elo}")
+
+    def _is_policy_engine(self) -> bool:
+        return PROFILES.get(self.cfg.engine, PROFILES["stockfish"]).display == "policy"
+
+    # ----- engine-selection slots -----
+    def _on_engine_changed(self, *_) -> None:
+        if self._loading:
+            return
+        self.cfg.engine = self.engine_combo.currentData()
+        self.cfg.save()
+        self._apply_engine_profile()
+        self._start_engine()
+        self._reanalyze_current()
+
+    def _on_leela_net_changed(self, *_) -> None:
+        if self._loading:
+            return
+        self.cfg.leela_network = self.leela_net_combo.currentData() or ""
+        self.cfg.save()
+        if self.cfg.engine == "leela":          # the net is baked into the lc0 process
+            self._start_engine()
+            self._reanalyze_current()
+
+    def _on_maia_model_changed(self, *_) -> None:
+        if self._loading:
+            return
+        self.cfg.maia_model = self.maia_model_combo.currentData()
+        self.cfg.save()
+        if self.cfg.engine == "maia2":          # the model is baked into the worker
+            self._start_engine()
+            self._reanalyze_current()
+
+    def _on_maia_elo_changed(self, *_) -> None:
+        if self._loading:
+            return
+        self.cfg.maia_player_elo = self.player_elo_slider.value()
+        self.cfg.maia_opp_elo = self.opp_elo_slider.value()
+        self._sync_maia_controls()
+        self.cfg.save()
+        self._reanalyze_current()               # Elos are per-request; no rebuild needed
 
     def _start_analysis(self, board: chess.Board) -> None:
         if not board.is_valid():
@@ -427,11 +563,17 @@ class MenuWindow(QtWidgets.QWidget):
             return
         self._analyzing_key = self._pos_key(board)
         self._req_id += 1
+        # Strength inputs differ per engine: Stockfish uses the simulated-Elo limiter
+        # on player_elo; Maia 2 uses your/opponent rating (no limiter). Leela ignores
+        # both. All go through the one request() interface.
+        if self.cfg.engine == "maia2":
+            limit, p_elo, o_elo = False, self.cfg.maia_player_elo, self.cfg.maia_opp_elo
+        else:
+            limit, p_elo, o_elo = self.cfg.limit_player_strength, self.cfg.player_elo, self.cfg.maia_opp_elo
         self._controller.request(board, self.cfg.multipv, self.cfg.engine_mode,
                                  self.cfg.engine_depth, self._player_color(), self._req_id,
                                  self.cfg.opp_lookahead_live, self.cfg.opp_lookahead_depth,
-                                 self.cfg.opp_lookahead_max,
-                                 self.cfg.limit_player_strength, self.cfg.player_elo)
+                                 self.cfg.opp_lookahead_max, limit, p_elo, o_elo)
         self.stop_btn.setEnabled(True)
 
     def _player_color(self) -> bool:
@@ -604,6 +746,7 @@ class MenuWindow(QtWidgets.QWidget):
         if token != self._req_id:        # stale emit from a superseded request
             return
         try:
+            policy = self._is_policy_engine()    # Maia: show human-move probabilities
             self.results_list.clear()
             flip = board.turn != chess.WHITE     # show eval ABSOLUTE (white +, black -)
             for s in suggestions:
@@ -611,16 +754,18 @@ class MenuWindow(QtWidgets.QWidget):
                     san = board.san(s.move)
                 except Exception:
                     san = s.uci
-                self.results_list.addItem(f"#{s.rank}  {san:7s} {s.eval_text_pov(flip)}")
+                value = f"{(s.policy or 0.0) * 100:.0f}%" if policy else s.eval_text_pov(flip)
+                self.results_list.addItem(f"#{s.rank}  {san:7s} {value}")
             self._suggestions = build_annotations(suggestions, opp_suggestions, self.cfg.show_predicted,
-                                                  board.turn == chess.WHITE, self.cfg.gold_moves)
+                                                  board.turn == chess.WHITE, self.cfg.gold_moves,
+                                                  policy_mode=policy)
             self._draw_arrows()
             if not suggestions:
                 self.status_label.setText(self._terminal_status(board, opp_suggestions))
             else:
                 note = ""
                 if opp_suggestions:
-                    if self.cfg.engine_mode == "predictive":
+                    if self.cfg.engine_mode == "predictive" or policy:
                         note = f"  (a reply to each of their {len(opp_suggestions)} likely moves)"
                     else:
                         try:
@@ -628,7 +773,9 @@ class MenuWindow(QtWidgets.QWidget):
                         except Exception:
                             opp_san = opp_suggestions[0].move.uci()
                         note = f"  (prep vs their best: {opp_san})"
-                self.status_label.setText(f"Depth {depth}, {len(suggestions)} line(s).{note}")
+                head = (f"Maia 2 — {len(suggestions)} human move(s)" if policy
+                        else f"Depth {depth}, {len(suggestions)} line(s)")
+                self.status_label.setText(f"{head}.{note}")
         except Exception as exc:
             self.status_label.setText(f"render error: {exc}")
 

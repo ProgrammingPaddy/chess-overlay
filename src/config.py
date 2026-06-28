@@ -36,6 +36,13 @@ class Config:
     # (greens); the opponent prediction (reds) always stays full strength.
     limit_player_strength: bool = False
     player_elo: int = 1500
+    # --- engine selection (Stockfish default; Leela/Maia 2 are optional add-ons) ---
+    engine: str = "stockfish"        # "stockfish" | "leela" | "maia2"
+    maia_player_elo: int = 1500      # Maia 2: your rating (the moves IT predicts for you)
+    maia_opp_elo: int = 1500         # Maia 2: opponent rating (predicts THEIR moves)
+    maia_model: str = "rapid"        # Maia 2 model: "rapid" | "blitz"
+    maia_device: str = "gpu"         # Maia 2 device: "gpu" | "cpu"
+    leela_network: str = ""          # Leela weights path ("" = auto-pick the strongest)
 
     # --- preferences (stable across sessions) ---
     board_monitor: int = 0
