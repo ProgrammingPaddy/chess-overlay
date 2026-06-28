@@ -71,31 +71,37 @@ class MiniBoard(QtWidgets.QWidget):
 
     def paintEvent(self, event: QtGui.QPaintEvent) -> None:
         p = QtGui.QPainter(self)
-        s = min(self.width(), self.height()) / 8.0
-        light, dark = QtGui.QColor(240, 217, 181), QtGui.QColor(181, 136, 99)
-        for r in range(8):
-            for c in range(8):
-                p.fillRect(QtCore.QRectF(c * s, r * s, s, s),
-                           light if (r + c) % 2 == 0 else dark)
-        font = p.font()
-        font.setPixelSize(int(s * 0.82))
-        p.setFont(font)
-        for r in range(8):
-            for c in range(8):
-                sq = chess.square(c, 7 - r) if self._white_bottom else chess.square(7 - c, r)
-                pc = self._board.piece_at(sq)
-                if pc is None:
-                    continue
-                glyph = _GLYPHS[pc.symbol().lower()]
-                rect = QtCore.QRectF(c * s, r * s, s, s)
-                if pc.color == chess.WHITE:           # outline white pieces for contrast
-                    p.setPen(QtGui.QColor(30, 30, 30))
-                    for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
-                        p.drawText(rect.translated(dx, dy), QtCore.Qt.AlignCenter, glyph)
-                    p.setPen(QtGui.QColor(250, 250, 250))
-                else:
-                    p.setPen(QtGui.QColor(20, 20, 20))
-                p.drawText(rect, QtCore.Qt.AlignCenter, glyph)
+        try:
+            s = min(self.width(), self.height()) / 8.0
+            light, dark = QtGui.QColor(240, 217, 181), QtGui.QColor(181, 136, 99)
+            for r in range(8):
+                for c in range(8):
+                    p.fillRect(QtCore.QRectF(c * s, r * s, s, s),
+                               light if (r + c) % 2 == 0 else dark)
+            font = p.font()
+            font.setPixelSize(max(1, int(s * 0.82)))
+            p.setFont(font)
+            for r in range(8):
+                for c in range(8):
+                    sq = chess.square(c, 7 - r) if self._white_bottom else chess.square(7 - c, r)
+                    pc = self._board.piece_at(sq)
+                    if pc is None:
+                        continue
+                    glyph = _GLYPHS[pc.symbol().lower()]
+                    rect = QtCore.QRectF(c * s, r * s, s, s)
+                    if pc.color == chess.WHITE:       # outline white pieces for contrast
+                        p.setPen(QtGui.QColor(30, 30, 30))
+                        for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                            p.drawText(rect.translated(dx, dy), QtCore.Qt.AlignCenter, glyph)
+                        p.setPen(QtGui.QColor(250, 250, 250))
+                    else:
+                        p.setPen(QtGui.QColor(20, 20, 20))
+                    p.drawText(rect, QtCore.Qt.AlignCenter, glyph)
+        except Exception:               # a paint must never crash the app
+            import traceback
+            traceback.print_exc()
+        finally:
+            p.end()
 
 
 class MenuWindow(QtWidgets.QWidget):

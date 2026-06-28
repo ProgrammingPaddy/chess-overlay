@@ -85,26 +85,35 @@ class EngineController(QtCore.QThread):
             return
         self.ready.emit()
         while not self._shutdown:
-            self._wake.wait(0.5)
-            self._wake.clear()
-            if self._shutdown:
-                break
-            with self._lock:
-                job, self._pending = self._pending, None
-                reconf, self._reconfigure = self._reconfigure, False
-                threads, hash_mb = self._threads, self._hash
-            if reconf and self._engine is not None:
-                try:
-                    self._engine.configure({"Threads": threads, "Hash": hash_mb})
-                except Exception:
-                    pass
-            if job is None:
-                continue
+            # The ENTIRE loop body is guarded: nothing here (a job, an engine death,
+            # a stop()/configure() race) may ever kill the analysis thread, or the
+            # overlay would silently stop updating for the rest of the session.
             try:
+                self._wake.wait(0.5)
+                self._wake.clear()
+                if self._shutdown:
+                    break
+                with self._lock:
+                    job, self._pending = self._pending, None
+                    reconf, self._reconfigure = self._reconfigure, False
+                    threads, hash_mb = self._threads, self._hash
+                if reconf and self._engine is not None:
+                    try:
+                        self._engine.configure({"Threads": threads, "Hash": hash_mb})
+                    except Exception:
+                        pass
+                if job is None:
+                    continue
+                if self._engine is None and not self._spawn_engine():
+                    self._wake.wait(1.0)      # engine down — back off, don't busy-loop
+                    continue
                 self._analyze(*job)
             except Exception as exc:
                 self.failed.emit(str(exc))
-                self._spawn_engine()      # respawn after a crash
+                try:
+                    self._spawn_engine()      # recover the engine after any error
+                except Exception:
+                    pass
         self._quit_engine()
 
     def _spawn_engine(self) -> bool:

@@ -269,13 +269,19 @@ class _OverlayWindow(QtWidgets.QWidget):
         # devicePixelRatio.
         origin = self._screen.geometry().topLeft()
         painter = QtGui.QPainter(self)
-        painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
-        painter.translate(-origin.x(), -origin.y())
-        if self._show_border:
-            self._draw_border(painter, self._geometry)
-        # Draw lower-ranked / opponent moves first so the best player move is on top.
-        for ann in sorted(self._annotations, key=lambda a: (not a.opponent, -a.rank)):
-            self._draw_move(painter, ann)
+        try:
+            painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+            painter.translate(-origin.x(), -origin.y())
+            if self._show_border:
+                self._draw_border(painter, self._geometry)
+            # Lower-ranked / opponent moves first so the best player move is on top.
+            for ann in sorted(self._annotations, key=lambda a: (not a.opponent, -a.rank)):
+                self._draw_move(painter, ann)
+        except Exception:               # a paint must never crash the app
+            import traceback
+            traceback.print_exc()
+        finally:
+            painter.end()
 
     @staticmethod
     def _draw_border(painter: QtGui.QPainter, g: BoardGeometry) -> None:
