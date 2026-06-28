@@ -26,6 +26,7 @@ from PySide6 import QtCore
 from src.engine import MoveSuggestion, win_prob_to_cp
 
 WORKER = Path(__file__).resolve().parent / "maia2_worker.py"
+WORKER_LOG = Path(__file__).resolve().parent.parent / "debug" / "maia2_worker.log"
 
 
 class Maia2Controller(QtCore.QThread):
@@ -42,6 +43,7 @@ class Maia2Controller(QtCore.QThread):
         self._type = model_type
         self._device = device
         self._proc: subprocess.Popen | None = None
+        self._logf = None
         self._lock = threading.Lock()
         self._pending: tuple | None = None
         self._wake = threading.Event()
@@ -70,6 +72,12 @@ class Maia2Controller(QtCore.QThread):
     def shutdown(self) -> None:
         self._shutdown = True
         self._wake.set()
+        p = self._proc
+        if p is not None:
+            try:
+                p.kill()            # closing the pipe unblocks a pending readline so run() exits
+            except Exception:
+                pass
         self.wait(6000)
 
     # ----- worker thread -----
@@ -89,23 +97,26 @@ class Maia2Controller(QtCore.QThread):
             try:
                 self._analyze(*job)
             except Exception as exc:
+                if self._shutdown:
+                    break               # tearing down — don't respawn
                 self.failed.emit(f"Maia 2: {exc}")
                 self._respawn()
         self._quit()
 
-    def _popen_kwargs(self) -> dict:
-        kw = dict(stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                  stderr=subprocess.DEVNULL, text=True, bufsize=1)
-        if sys.platform == "win32":
-            kw["creationflags"] = 0x08000000   # CREATE_NO_WINDOW — no console popup
-        return kw
-
     def _spawn(self) -> bool:
         try:
+            try:
+                WORKER_LOG.parent.mkdir(exist_ok=True)
+                self._logf = open(WORKER_LOG, "a", encoding="utf-8")
+            except Exception:
+                self._logf = subprocess.DEVNULL
+            kw = dict(stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                      stderr=self._logf, text=True, bufsize=1)
+            if sys.platform == "win32":
+                kw["creationflags"] = 0x08000000   # CREATE_NO_WINDOW — no console popup
             self._proc = subprocess.Popen(
                 [self._worker_python, str(WORKER), "--type", self._type,
-                 "--device", self._device, "--save-root", self._save_root],
-                **self._popen_kwargs())
+                 "--device", self._device, "--save-root", self._save_root], **kw)
             banner = json.loads(self._proc.stdout.readline() or "{}")
             if not banner.get("ready"):
                 self.failed.emit(f"Maia 2 worker failed: {banner.get('error', 'no response')}")
@@ -131,6 +142,12 @@ class Maia2Controller(QtCore.QThread):
                 except Exception:
                     pass
             self._proc = None
+        if self._logf not in (None, subprocess.DEVNULL):
+            try:
+                self._logf.close()
+            except Exception:
+                pass
+        self._logf = None
 
     def _query(self, queries: list[dict], top_k: int) -> list[dict]:
         self._rid += 1
@@ -190,17 +207,21 @@ class Maia2Controller(QtCore.QThread):
             return
 
         if mode == "predictive":
-            # one human reply (at the player's Elo) to EACH opponent move
-            reply_boards, queries = [], []
+            # one human reply (at the player's Elo) to EACH opponent move; skip any
+            # opponent move that ends the game (Maia can't be queried on a position
+            # with no legal moves). Rank pairs the reply to its opponent move.
+            specs, queries = [], []
             for opp in opp_sugg:
                 b2 = board.copy()
                 b2.push(opp.move)
-                reply_boards.append(b2)
+                if b2.legal_moves.count() == 0:
+                    continue
+                specs.append((opp.rank, b2))
                 queries.append({"fen": b2.fen(), "elo_self": player_elo, "elo_oppo": opp_elo})
-            results = self._query(queries, 1)
+            results = self._query(queries, 1) if queries else []
             greens = []
-            for rank, (b2, r) in enumerate(zip(reply_boards, results), start=1):
-                top = self._suggestions(r, b2, start_rank=rank)
+            for (opp_rank, b2), r in zip(specs, results):
+                top = self._suggestions(r, b2, start_rank=opp_rank)
                 if top:
                     greens.append(top[0])        # the single best human reply, paired to its opp move
             target = board.copy()

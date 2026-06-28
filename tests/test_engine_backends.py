@@ -114,6 +114,14 @@ if py:
         cap.clear()
         c._analyze(chess.Board(), 3, "predictive", chess.BLACK, 2, 1300, 1700)
         check("maia2 opponent reds present", len(cap.get("o") or []) >= 1)
+        # robustness: a terminal position (no legal moves — Maia raises on it) must
+        # NOT crash the worker or fail the rest of the batch. (Fool's mate position.)
+        mate_fen = "rnb1kbnr/pppp1ppp/8/4p3/6Pq/5P2/PPPPP2P/RNBQKBNR w KQkq - 1 3"
+        res = c._query([{"fen": mate_fen, "elo_self": 1500, "elo_oppo": 1500},
+                        {"fen": chess.Board().fen(), "elo_self": 1500, "elo_oppo": 1500}], 3)
+        check("terminal query returns an empty (not failed) result", len(res) == 2 and res[0]["moves"] == [])
+        check("a normal query in the same batch still works", len(res[1]["moves"]) >= 1)
+        check("the worker is still alive after a terminal query", c._proc.poll() is None)
         c._quit()
     else:
         print("  SKIP  maia2 env present but worker failed to spawn")

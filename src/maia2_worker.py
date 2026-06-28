@@ -69,17 +69,21 @@ def main() -> int:
             break
         rid = req.get("id")
         top_k = int(req.get("top_k", 5))
-        try:
-            results = []
-            for q in req.get("queries", []):
+        results = []
+        for q in req.get("queries", []):
+            # Each query is isolated: maia2 raises on a position with no legal moves
+            # (checkmate/stalemate) or an illegal FEN, and one bad query must NOT take
+            # down the whole batch (that would look like an engine crash). A failed
+            # query just yields no prediction.
+            try:
                 move_probs, win_prob = inference.inference_each(
                     maia_model, prepared, q["fen"], int(q["elo_self"]), int(q["elo_oppo"]))
                 moves = sorted(((k, float(v)) for k, v in move_probs.items()),
                                key=lambda kv: -kv[1])[:top_k]
                 results.append({"win_prob": float(win_prob), "moves": moves})
-            emit({"id": rid, "results": results})
-        except Exception as exc:
-            emit({"id": rid, "error": repr(exc)})
+            except Exception:
+                results.append({"win_prob": None, "moves": []})
+        emit({"id": rid, "results": results})
     return 0
 
 
