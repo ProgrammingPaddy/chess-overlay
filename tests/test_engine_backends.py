@@ -128,6 +128,34 @@ if py:
 else:
     print("  SKIP  maia2 env not installed")
 
+# --- puzzle mode: converge on the decisive side (gated on Stockfish) ---------
+from src.engine import find_stockfish
+
+sf = find_stockfish()
+if sf:
+    from src.analysis import EngineController as _Sf
+    cpz = _Sf(sf, 2, 64)
+    if cpz._spawn_engine():
+        cap = {}
+        cpz.updated.connect(lambda s, d, b, o, t: cap.update(s=s, b=b))
+        cpz._analyze_puzzle(chess.Board("6k1/5ppp/8/8/8/8/8/R5K1 w - - 0 1"), 3, 12, 1)
+        check("puzzle converges on White (who is mating)",
+              cap.get("b") is not None and cap["b"].turn == chess.WHITE)
+        check("puzzle shows White's mating move", cap.get("s")
+              and cap["s"][0].move == chess.Move.from_uci("a1a8"))
+        cap.clear()
+        cpz._analyze_puzzle(chess.Board("r5k1/8/8/8/8/8/5PPP/6K1 b - - 0 1"), 3, 12, 2)
+        check("puzzle converges on Black (who is mating)",
+              cap.get("b") is not None and cap["b"].turn == chess.BLACK)
+        check("puzzle shows Black's mating move", cap.get("s")
+              and cap["s"][0].move == chess.Move.from_uci("a8a1"))
+        cpz._quit_engine()
+    else:
+        print("  SKIP  stockfish puzzle (spawn failed)")
+else:
+    print("  SKIP  stockfish not found for the puzzle test")
+
+
 # --- the engine registry / factory ------------------------------------------
 from src.config import Config
 from src.engine_profiles import ENGINE_ORDER, PROFILES, availability, make_controller

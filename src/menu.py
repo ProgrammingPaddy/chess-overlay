@@ -418,6 +418,21 @@ class MenuWindow(QtWidgets.QWidget):
         opts.addWidget(self.pause_drag_cb)
         v.addLayout(opts)
 
+        # Puzzle mode — treat the position as an isolated puzzle.
+        puzzle = QtWidgets.QGroupBox("Puzzle mode")
+        pf = QtWidgets.QVBoxLayout(puzzle)
+        self.puzzle_cb = QtWidgets.QCheckBox("Puzzle mode (analyse both sides, find the side to move)")
+        self.puzzle_cb.setChecked(self.cfg.puzzle_mode)
+        self.puzzle_cb.setToolTip(
+            "For tactics puzzles with no move history: analyses the position as both "
+            "White-to-move and Black-to-move and shows the decisive side's best move. "
+            "Eval engines only (Stockfish / Leela).")
+        pf.addWidget(self.puzzle_cb)
+        self.puzzle_winning_cb = QtWidgets.QCheckBox("Show only the winning side's best move")
+        self.puzzle_winning_cb.setChecked(self.cfg.puzzle_winning_only)
+        pf.addWidget(self.puzzle_winning_cb)
+        v.addWidget(puzzle)
+
         self.fen_edit = QtWidgets.QLineEdit(chess.STARTING_FEN)
         v.addWidget(self.fen_edit)
         row = QtWidgets.QHBoxLayout()
@@ -475,6 +490,8 @@ class MenuWindow(QtWidgets.QWidget):
         self.turn_black_btn.clicked.connect(lambda: self._set_turn(False))
         self.turn_mine_btn.clicked.connect(lambda: self._set_turn(self._player_color() == chess.WHITE))
         self.turn_opp_btn.clicked.connect(lambda: self._set_turn(self._player_color() != chess.WHITE))
+        self.puzzle_cb.toggled.connect(self._on_puzzle_toggled)
+        self.puzzle_winning_cb.toggled.connect(self._on_puzzle_winning_toggled)
         self.strength_preset.currentIndexChanged.connect(self._on_strength_preset)
         self.strength_slider.valueChanged.connect(self._on_strength_slider)
         # Engine selection + per-engine option controls.
@@ -630,10 +647,11 @@ class MenuWindow(QtWidgets.QWidget):
             limit, p_elo, o_elo = False, self.cfg.maia_player_elo, self.cfg.maia_opp_elo
         else:
             limit, p_elo, o_elo = self.cfg.limit_player_strength, self.cfg.player_elo, self.cfg.maia_opp_elo
+        puzzle = self.cfg.puzzle_mode and not self._is_policy_engine()   # eval engines only
         self._controller.request(board, self.cfg.multipv, self.cfg.engine_mode,
                                  self.cfg.engine_depth, self._player_color(), self._req_id,
                                  self.cfg.opp_lookahead_live, self.cfg.opp_lookahead_depth,
-                                 self.cfg.opp_lookahead_max, limit, p_elo, o_elo)
+                                 self.cfg.opp_lookahead_max, limit, p_elo, o_elo, puzzle)
         self.stop_btn.setEnabled(True)
 
     def _player_color(self) -> bool:
@@ -814,6 +832,10 @@ class MenuWindow(QtWidgets.QWidget):
             return
         try:
             policy = self._is_policy_engine()    # Maia: show human-move probabilities
+            puzzle = self.cfg.puzzle_mode and not policy
+            # In puzzle mode the greens are the (engine-determined) side-to-move's best
+            # and the reds are the other side; 'winning side only' hides the reds.
+            show_opp = (not self.cfg.puzzle_winning_only) if puzzle else self.cfg.show_predicted
             self.results_list.clear()
             flip = board.turn != chess.WHITE     # show eval ABSOLUTE (white +, black -)
             for s in suggestions:
@@ -823,12 +845,17 @@ class MenuWindow(QtWidgets.QWidget):
                     san = s.uci
                 value = f"{(s.policy or 0.0) * 100:.0f}%" if policy else s.eval_text_pov(flip)
                 self.results_list.addItem(f"#{s.rank}  {san:7s} {value}")
-            self._suggestions = build_annotations(suggestions, opp_suggestions, self.cfg.show_predicted,
+            self._suggestions = build_annotations(suggestions, opp_suggestions, show_opp,
                                                   board.turn == chess.WHITE, self.cfg.gold_moves,
                                                   policy_mode=policy)
             self._draw_arrows()
             if not suggestions:
                 self.status_label.setText(self._terminal_status(board, opp_suggestions))
+            elif puzzle:
+                side = "White" if board.turn == chess.WHITE else "Black"
+                extra = "" if self.cfg.puzzle_winning_only else f" (other side's best in red)"
+                self.status_label.setText(
+                    f"Puzzle — {side} to move & winning. Best for {side}.{extra}")
             else:
                 note = ""
                 if opp_suggestions:
@@ -1076,6 +1103,22 @@ class MenuWindow(QtWidgets.QWidget):
         self.tracker.set_turn(bool(white_to_move))
         self._after_commit()
         self.status_label.setText(f"Set: {'White' if white_to_move else 'Black'} to move.")
+
+    def _on_puzzle_toggled(self, on: bool) -> None:
+        if self._loading:
+            return
+        self.cfg.puzzle_mode = on
+        self.cfg.save()
+        if on and self._is_policy_engine():
+            self.status_label.setText("Puzzle mode needs an eval engine (Stockfish or Leela) — Maia plays normally.")
+        self._reanalyze_current()
+
+    def _on_puzzle_winning_toggled(self, on: bool) -> None:
+        if self._loading:
+            return
+        self.cfg.puzzle_winning_only = on
+        self.cfg.save()
+        self._reanalyze_current()
 
     def _on_track_toggled(self, on: bool) -> None:
         if self._loading:

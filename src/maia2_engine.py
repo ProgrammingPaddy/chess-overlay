@@ -55,7 +55,8 @@ class Maia2Controller(QtCore.QThread):
                 player_color: bool | None = None, token: int = 0,
                 opp_live: bool = False, opp_depth: int = 12, opp_max: int = 22,
                 limit_strength: bool = False, player_elo: int = 1500,
-                opp_elo: int = 1500) -> None:
+                opp_elo: int = 1500, puzzle: bool = False) -> None:
+        # puzzle is eval-engine only; Maia ignores it (falls back to normal play).
         with self._lock:
             self._pending = (board.copy(), multipv, mode, player_color, token,
                              int(player_elo), int(opp_elo))

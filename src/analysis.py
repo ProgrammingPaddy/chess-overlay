@@ -56,12 +56,12 @@ class EngineController(QtCore.QThread):
                 player_color: bool | None = None, token: int = 0,
                 opp_live: bool = False, opp_depth: int = 12, opp_max: int = 22,
                 limit_strength: bool = False, player_elo: int = 1500,
-                opp_elo: int = 1500) -> None:
+                opp_elo: int = 1500, puzzle: bool = False) -> None:
         # opp_elo is part of the shared engine interface (used by the Maia 2
         # controller); the search engines ignore it.
         with self._lock:
             self._pending = (board.copy(), multipv, mode, depth, player_color, token,
-                             opp_live, opp_depth, opp_max, limit_strength, player_elo)
+                             opp_live, opp_depth, opp_max, limit_strength, player_elo, puzzle)
         self._interrupt()
 
     def clear(self) -> None:
@@ -236,7 +236,8 @@ class EngineController(QtCore.QThread):
     def _analyze(self, board: chess.Board, multipv: int, mode: str, depth: int,
                  player_color: bool | None = None, token: int = 0,
                  opp_live: bool = False, opp_depth: int = 12, opp_max: int = 22,
-                 limit_strength: bool = False, player_elo: int = 1500) -> None:
+                 limit_strength: bool = False, player_elo: int = 1500,
+                 puzzle: bool = False) -> None:
         # Tempo model:
         #   * player to move  -> analyse the CURRENT position for the player.
         #   * opponent to move -> look ahead (see _analyze_opponent_turn): the
@@ -247,6 +248,9 @@ class EngineController(QtCore.QThread):
         # The player's eval can be strength-limited (simulated Elo); the opponent
         # prediction always stays full strength. Applied per-analysis below.
         self._strength = (bool(limit_strength), int(player_elo))
+        if puzzle:
+            self._analyze_puzzle(board, multipv, depth, token)
+            return
         if board.legal_moves.count() == 0:
             self.updated.emit([], 0, board, [], token)
             return
@@ -261,6 +265,46 @@ class EngineController(QtCore.QThread):
         # Player to move: analyse the real position (streaming live / fixed depth).
         self._strength_player()
         self._stream_player(board, multipv, mode, depth, [], token)
+
+    @staticmethod
+    def _side_value(suggestions: list) -> float:
+        """How good the side-to-move's best move is, from THEIR POV (mate dominates)."""
+        if not suggestions:
+            return -1e9
+        s = suggestions[0]
+        if s.mate_in is not None:
+            return 1e6 - s.mate_in if s.mate_in > 0 else -1e6 - s.mate_in
+        return float(s.score_cp) if s.score_cp is not None else 0.0
+
+    def _analyze_puzzle(self, board: chess.Board, multipv: int, depth: int, token: int) -> None:
+        """Puzzle mode: treat the position as isolated and work out whose move it is by
+        analysing BOTH sides, then show the decisive (side-to-move) side's best move(s)
+        as the greens and the other side's as the reds. The side to move is the one
+        whose best move is more decisive in their favour; a side that is illegal to
+        move (would leave the opponent in check) or has no moves is discarded, which
+        also resolves the turn when one side is in check. Always full strength."""
+        self._strength_full()
+        best = {}
+        for color in (chess.WHITE, chess.BLACK):
+            if self._wake.is_set() or self._shutdown:
+                return
+            b = board.copy()
+            b.turn = color
+            b.clear_stack()
+            best[color] = self._top_moves(b, multipv, depth) if (b.is_valid()
+                          and b.legal_moves.count() > 0) else []
+        white_sugg, black_sugg = best[chess.WHITE], best[chess.BLACK]
+        if not white_sugg and not black_sugg:
+            self.updated.emit([], 0, board, [], token)
+            return
+        if self._side_value(white_sugg) >= self._side_value(black_sugg):
+            win_color, win_sugg, lose_sugg = chess.WHITE, white_sugg, black_sugg
+        else:
+            win_color, win_sugg, lose_sugg = chess.BLACK, black_sugg, white_sugg
+        target = board.copy()
+        target.turn = win_color
+        target.clear_stack()
+        self.updated.emit(win_sugg, depth, target, lose_sugg, token)
 
     def _stream_player(self, target_board: chess.Board, multipv: int, mode: str,
                        depth: int, opp_suggestions: list, token: int,
