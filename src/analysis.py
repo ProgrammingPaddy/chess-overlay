@@ -28,11 +28,16 @@ class EngineController(QtCore.QThread):
     LOOKAHEAD_DEPTH = 12   # default one-shot / preview opponent look-ahead depth
     LOOKAHEAD_STEP = 2     # depth increment per 'live' refinement round
 
-    def __init__(self, engine_path: str, threads: int, hash_mb: int, parent=None):
+    def __init__(self, engine_path: str, threads: int, hash_mb: int, parent=None,
+                 extra_options: dict | None = None):
         super().__init__(parent)
         self._path = engine_path
         self._threads = threads
         self._hash = hash_mb
+        # Engine-specific UCI options (e.g. lc0's WeightsFile / UCI_ShowWDL). They
+        # are capability-filtered on apply, so Stockfish (which has none of them) is
+        # entirely unaffected and this same class drives lc0 too.
+        self._extra_options = dict(extra_options or {})
         self._reconfigure = False
         self._lock = threading.Lock()
         self._pending: tuple | None = None     # (board, multipv, mode, depth)
@@ -50,7 +55,10 @@ class EngineController(QtCore.QThread):
     def request(self, board: chess.Board, multipv: int, mode: str, depth: int,
                 player_color: bool | None = None, token: int = 0,
                 opp_live: bool = False, opp_depth: int = 12, opp_max: int = 22,
-                limit_strength: bool = False, player_elo: int = 1500) -> None:
+                limit_strength: bool = False, player_elo: int = 1500,
+                opp_elo: int = 1500) -> None:
+        # opp_elo is part of the shared engine interface (used by the Maia 2
+        # controller); the search engines ignore it.
         with self._lock:
             self._pending = (board.copy(), multipv, mode, depth, player_color, token,
                              opp_live, opp_depth, opp_max, limit_strength, player_elo)
@@ -98,10 +106,7 @@ class EngineController(QtCore.QThread):
                     reconf, self._reconfigure = self._reconfigure, False
                     threads, hash_mb = self._threads, self._hash
                 if reconf and self._engine is not None:
-                    try:
-                        self._engine.configure({"Threads": threads, "Hash": hash_mb})
-                    except Exception:
-                        pass
+                    self._safe_configure({"Threads": threads, "Hash": hash_mb})
                 if job is None:
                     continue
                 if self._engine is None and not self._spawn_engine():
@@ -120,13 +125,28 @@ class EngineController(QtCore.QThread):
         self._quit_engine()
         try:
             self._engine = chess.engine.SimpleEngine.popen_uci(self._path)
-            self._engine.configure({"Threads": self._threads, "Hash": self._hash})
+            self._safe_configure({"Threads": self._threads, "Hash": self._hash,
+                                  **self._extra_options})
             self._detect_strength_support()
             self._applied_strength = None       # a fresh engine is full strength; force re-apply
             return True
         except Exception as exc:
             self.failed.emit(f"engine failed to start: {exc}")
             return False
+
+    def _safe_configure(self, want: dict) -> None:
+        """Configure only the options the engine actually exposes — so sending
+        Stockfish's Hash to lc0 (which has no Hash) is silently skipped instead of
+        erroring, and the same controller drives both."""
+        if self._engine is None:
+            return
+        opts = getattr(self._engine, "options", {}) or {}
+        cfg = {k: v for k, v in want.items() if k in opts}
+        if cfg:
+            try:
+                self._engine.configure(cfg)
+            except Exception:
+                pass
 
     def _detect_strength_support(self) -> None:
         """Note whether the engine exposes UCI_LimitStrength/UCI_Elo and its range."""
