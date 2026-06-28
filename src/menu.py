@@ -36,6 +36,8 @@ FRAME_MIN = 0.45         # min per-frame match quality to treat it as a real boa
 NO_BOARD_CERT = 0.30     # sustained reads below this => clearly no board (clear arrows)
 NO_BOARD_FRAMES = 4
 RESYNC_CONFIRM = 2       # stable non-legal reads before resyncing (filters drags)
+MAIA_ELO_MIN = 1100      # Maia 2's trained rating range (values outside clamp)
+MAIA_ELO_MAX = 1900
 
 
 def _left_mouse_down() -> bool:
@@ -282,16 +284,22 @@ class MenuWindow(QtWidgets.QWidget):
                            ("Advanced (~2200)", 2200), ("Intermediate (~1800)", 1800),
                            ("Casual (~1500)", 1500), ("Beginner (~1320)", 1320), ("Custom", "custom")):
             self.strength_preset.addItem(text, data)
+        self.strength_preset.setToolTip(
+            "Caps Stockfish's strength for YOUR suggestions via UCI_LimitStrength. "
+            "Maximum = unchanged full strength.")
         sf.addRow("Preset", self.strength_preset)
         self.strength_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
         self.strength_slider.setRange(1320, 3190)
         self.strength_slider.setSingleStep(20)
         self.strength_slider.setPageStep(100)
         self.strength_slider.setValue(self.cfg.player_elo)
+        self.strength_slider.setToolTip("Stockfish's UCI_Elo range is 1320–3190.")
         self.strength_value = QtWidgets.QLabel()
         sf.addRow("Simulated Elo", self.strength_slider)
         sf.addRow("", self.strength_value)
-        sf_note = QtWidgets.QLabel("Caps only YOUR suggestions; the opponent prediction stays full strength.")
+        sf_note = QtWidgets.QLabel(
+            "Caps only YOUR suggestions (greens); the opponent prediction (reds) always "
+            "stays full strength. Range 1320–3190.")
         sf_note.setWordWrap(True)
         sf.addRow(sf_note)
         v.addWidget(self.strength_group)
@@ -307,25 +315,30 @@ class MenuWindow(QtWidgets.QWidget):
             if i >= 0:
                 self.leela_net_combo.setCurrentIndex(i)
         lf.addRow("Network", self.leela_net_combo)
-        l_note = QtWidgets.QLabel("A strong general net, or a Maia rating net for human-like play.")
+        self.leela_net_combo.setToolTip(
+            "Leela's strength/style IS its network. The strong general net plays at a "
+            "high level; a Maia rating net plays human-like at that Elo.")
+        l_note = QtWidgets.QLabel("Strength = the network. Strong general net, or a Maia rating net for human play.")
         l_note.setWordWrap(True)
         lf.addRow(l_note)
         v.addWidget(self.leela_group)
 
-        # --- Maia 2 (human Elo) ---
+        # --- Maia 2 (human Elo). Maia is trained on 1100-1900; above/below clamps. ---
         self.maia_group = QtWidgets.QGroupBox("Maia 2 — human strength")
         mf = QtWidgets.QFormLayout(self.maia_group)
         self.player_elo_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-        self.player_elo_slider.setRange(1100, 2000)
-        self.player_elo_slider.setSingleStep(50)
+        self.player_elo_slider.setRange(MAIA_ELO_MIN, MAIA_ELO_MAX)
+        self.player_elo_slider.setSingleStep(100)
         self.player_elo_slider.setPageStep(100)
-        self.player_elo_slider.setValue(min(2000, max(1100, self.cfg.maia_player_elo)))
+        self.player_elo_slider.setValue(min(MAIA_ELO_MAX, max(MAIA_ELO_MIN, self.cfg.maia_player_elo)))
+        self.player_elo_slider.setToolTip("The rating Maia emulates for YOUR moves (the greens).")
         self.player_elo_value = QtWidgets.QLabel()
         self.opp_elo_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-        self.opp_elo_slider.setRange(1100, 2000)
-        self.opp_elo_slider.setSingleStep(50)
+        self.opp_elo_slider.setRange(MAIA_ELO_MIN, MAIA_ELO_MAX)
+        self.opp_elo_slider.setSingleStep(100)
         self.opp_elo_slider.setPageStep(100)
-        self.opp_elo_slider.setValue(min(2000, max(1100, self.cfg.maia_opp_elo)))
+        self.opp_elo_slider.setValue(min(MAIA_ELO_MAX, max(MAIA_ELO_MIN, self.cfg.maia_opp_elo)))
+        self.opp_elo_slider.setToolTip("The rating Maia emulates for the OPPONENT's moves (the reds).")
         self.opp_elo_value = QtWidgets.QLabel()
         self.maia_model_combo = QtWidgets.QComboBox()
         self.maia_model_combo.addItem("Rapid", "rapid")
@@ -336,7 +349,9 @@ class MenuWindow(QtWidgets.QWidget):
         mf.addRow("Opponent Elo", self.opp_elo_slider)
         mf.addRow("", self.opp_elo_value)
         mf.addRow("Model", self.maia_model_combo)
-        m_note = QtWidgets.QLabel("Shows the moves a human of your Elo would likely play (probabilities, no search).")
+        m_note = QtWidgets.QLabel(
+            f"Predicts the moves a human of that rating would play (Maia is trained on "
+            f"{MAIA_ELO_MIN}–{MAIA_ELO_MAX}; values outside clamp).")
         m_note.setWordWrap(True)
         mf.addRow(m_note)
         v.addWidget(self.maia_group)
@@ -530,9 +545,26 @@ class MenuWindow(QtWidgets.QWidget):
         self.leela_group.setVisible("leela_network" in f)
         self.maia_group.setVisible("player_elo" in f)
 
+    @staticmethod
+    def _maia_band(elo: int) -> str:
+        if elo <= MAIA_ELO_MIN:
+            return "beginner"
+        if elo < 1400:
+            return "casual"
+        if elo < 1700:
+            return "intermediate"
+        return "advanced club"
+
     def _sync_maia_controls(self) -> None:
-        self.player_elo_value.setText(f"Elo {self.cfg.maia_player_elo}")
-        self.opp_elo_value.setText(f"Elo {self.cfg.maia_opp_elo}")
+        # Clamp persisted values to Maia's trained range so the UI reflects reality.
+        self.cfg.maia_player_elo = min(MAIA_ELO_MAX, max(MAIA_ELO_MIN, self.cfg.maia_player_elo))
+        self.cfg.maia_opp_elo = min(MAIA_ELO_MAX, max(MAIA_ELO_MIN, self.cfg.maia_opp_elo))
+        for slider, value, elo in ((self.player_elo_slider, self.player_elo_value, self.cfg.maia_player_elo),
+                                   (self.opp_elo_slider, self.opp_elo_value, self.cfg.maia_opp_elo)):
+            slider.blockSignals(True)
+            slider.setValue(elo)
+            slider.blockSignals(False)
+            value.setText(f"Elo {elo} · {self._maia_band(elo)}")
 
     def _is_policy_engine(self) -> bool:
         return PROFILES.get(self.cfg.engine, PROFILES["stockfish"]).display == "policy"
