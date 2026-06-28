@@ -347,36 +347,61 @@ class MenuWindow(QtWidgets.QWidget):
     def _tab_play(self) -> QtWidgets.QWidget:
         w = QtWidgets.QWidget()
         v = QtWidgets.QVBoxLayout(w)
-        top = QtWidgets.QFormLayout()
-        self.side_combo = QtWidgets.QComboBox()
-        for text, data in (("Auto-detect (from the board)", "auto"),
-                           ("I'm White (white on bottom)", "white"),
-                           ("I'm Black (black on bottom)", "black")):
-            self.side_combo.addItem(text, data)
-        self.side_combo.setCurrentIndex(max(0, self.side_combo.findData(self.cfg.analyze_for)))
-        self.side_combo.setToolTip(
-            "Which colour you play. Auto-detect follows the board (recommended); "
-            "if it's ever wrong, click 'Calibrate vision' to re-detect.")
-        top.addRow("I play as", self.side_combo)
+        # Seat & orientation. These are INDEPENDENT: orientation (which army is on the
+        # bottom) is detected by vision; your seat (bottom/top) is where you sit. Your
+        # colour is derived, so changing seat never rotates the board.
+        seat = QtWidgets.QGroupBox("Seat && orientation")
+        sf = QtWidgets.QFormLayout(seat)
+        self.player_side_combo = QtWidgets.QComboBox()
+        self.player_side_combo.addItem("I'm on the bottom (default)", "bottom")
+        self.player_side_combo.addItem("I'm on the top", "top")
+        self.player_side_combo.setCurrentIndex(
+            max(0, self.player_side_combo.findData(self.cfg.player_side)))
+        self.player_side_combo.setToolTip(
+            "Which side of the board YOU sit on. Your colour follows the pieces on "
+            "that side — this never rotates the board.")
+        sf.addRow("Player side", self.player_side_combo)
         self.orientation_label = QtWidgets.QLabel()
         self.orientation_label.setWordWrap(True)
-        top.addRow("", self.orientation_label)
+        sf.addRow(self.orientation_label)
+        self.flip_orient_btn = QtWidgets.QPushButton("Flip board orientation (if vision read it upside down)")
+        self.flip_orient_btn.setToolTip(
+            "Fallback only — rotates the board 180°. Normally orientation is detected "
+            "automatically; recalibrating vision is the cleaner fix.")
+        sf.addRow(self.flip_orient_btn)
+        v.addWidget(seat)
+
+        # Whose turn — the weakest signal, so make it explicit and overridable.
+        turn = QtWidgets.QGroupBox("Whose turn")
+        tf = QtWidgets.QVBoxLayout(turn)
+        self.turn_label = QtWidgets.QLabel("To move: —")
+        tf.addWidget(self.turn_label)
+        trow = QtWidgets.QHBoxLayout()
+        self.turn_white_btn = QtWidgets.QPushButton("White to move")
+        self.turn_black_btn = QtWidgets.QPushButton("Black to move")
+        self.turn_mine_btn = QtWidgets.QPushButton("My move")
+        self.turn_opp_btn = QtWidgets.QPushButton("Opponent's move")
+        for b in (self.turn_white_btn, self.turn_black_btn, self.turn_mine_btn, self.turn_opp_btn):
+            trow.addWidget(b)
+        tf.addLayout(trow)
+        turn_note = QtWidgets.QLabel(
+            "Turn is inferred from your moves; correct it here if the tracker drifts. "
+            "'My/Opponent's move' set it relative to your colour.")
+        turn_note.setWordWrap(True)
+        tf.addWidget(turn_note)
+        v.addWidget(turn)
+
+        opts = QtWidgets.QVBoxLayout()
         self.track_cb = QtWidgets.QCheckBox("Auto-track game (live board → engine)")
         self.track_cb.setChecked(self.cfg.auto_track)
-        top.addRow(self.track_cb)
+        opts.addWidget(self.track_cb)
         self.predict_cb = QtWidgets.QCheckBox("Show opponent's likely moves (red) on their turn")
         self.predict_cb.setChecked(self.cfg.show_predicted)
-        top.addRow(self.predict_cb)
+        opts.addWidget(self.predict_cb)
         self.pause_drag_cb = QtWidgets.QCheckBox("Pause eval while dragging a piece")
         self.pause_drag_cb.setChecked(self.cfg.pause_on_drag)
-        top.addRow(self.pause_drag_cb)
-        self.turn_label = QtWidgets.QLabel("To move: —")
-        self.flip_turn_btn = QtWidgets.QPushButton("Flip whose turn it is")
-        self.flip_turn_btn.setToolTip(
-            "Correct whose turn it is if the tracker got it wrong. "
-            "Does NOT change board orientation or your colour.")
-        top.addRow(self.turn_label, self.flip_turn_btn)
-        v.addLayout(top)
+        opts.addWidget(self.pause_drag_cb)
+        v.addLayout(opts)
 
         self.fen_edit = QtWidgets.QLineEdit(chess.STARTING_FEN)
         v.addWidget(self.fen_edit)
@@ -427,11 +452,14 @@ class MenuWindow(QtWidgets.QWidget):
         self.track_cb.toggled.connect(self._on_track_toggled)
         self.reset_game_btn.clicked.connect(self._on_reset_game)
         self.newgame_btn.clicked.connect(self._on_new_game)
-        self.flip_turn_btn.clicked.connect(self._on_flip_turn)
-        # 'I play as' is the single orientation/colour control (side on bottom is
-        # the player); it gets a dedicated handler that flips the board AND re-runs
-        # analysis immediately.
-        self.side_combo.currentIndexChanged.connect(self._on_side_changed)
+        # Seat (re-derives colour, never rotates) + manual orientation fallback.
+        self.player_side_combo.currentIndexChanged.connect(self._on_player_side_changed)
+        self.flip_orient_btn.clicked.connect(self._on_flip_orientation)
+        # Explicit turn controls.
+        self.turn_white_btn.clicked.connect(lambda: self._set_turn(True))
+        self.turn_black_btn.clicked.connect(lambda: self._set_turn(False))
+        self.turn_mine_btn.clicked.connect(lambda: self._set_turn(self._player_color() == chess.WHITE))
+        self.turn_opp_btn.clicked.connect(lambda: self._set_turn(self._player_color() != chess.WHITE))
         self.strength_preset.currentIndexChanged.connect(self._on_strength_preset)
         self.strength_slider.valueChanged.connect(self._on_strength_slider)
         # Engine selection + per-engine option controls.
@@ -577,12 +605,15 @@ class MenuWindow(QtWidgets.QWidget):
         self.stop_btn.setEnabled(True)
 
     def _player_color(self) -> bool:
-        """Which colour the human plays. The contract is 'side on bottom is the
-        player', so this is derived from the board orientation alone — a single
-        source of truth shared with vision and the overlay. The 'I play as' control
-        sets the orientation (see ``_on_side_changed``), so they can never disagree
-        and the look-ahead always knows whose turn it is."""
-        return chess.WHITE if self.cfg.white_bottom else chess.BLACK
+        """Which colour the human plays — DERIVED, never set directly.
+
+        Two independent facts: the board ORIENTATION (``white_bottom``, detected by
+        vision — which army is on the bottom) and your SEAT (``player_side``, where
+        you sit, default bottom). Your colour is simply whoever's army is on your
+        side. Because colour is derived, picking your side never rotates the board
+        (that was the old 'I play as' bug)."""
+        player_on_bottom = (self.cfg.player_side != "top")
+        return chess.WHITE if (self.cfg.white_bottom == player_on_bottom) else chess.BLACK
 
     def _stop_analysis(self) -> None:
         if self._controller is not None:
@@ -602,23 +633,26 @@ class MenuWindow(QtWidgets.QWidget):
         self._analyzing_key = None        # defeat the unchanged-position guard
         self._start_analysis(board)
 
-    # ----------------------------------------------------- orientation / side
-    def _sync_side_combo(self) -> None:
-        self.side_combo.blockSignals(True)
-        self.side_combo.setCurrentIndex(max(0, self.side_combo.findData(self.cfg.analyze_for)))
-        self.side_combo.blockSignals(False)
+    # ------------------------------------------------- orientation / seat / side
+    def _sync_player_side_combo(self) -> None:
+        self.player_side_combo.blockSignals(True)
+        self.player_side_combo.setCurrentIndex(
+            max(0, self.player_side_combo.findData(self.cfg.player_side)))
+        self.player_side_combo.blockSignals(False)
 
     def _refresh_orientation_label(self) -> None:
-        """Spell out the effective orientation so 'I play as' is never ambiguous."""
-        side = "White" if self.cfg.white_bottom else "Black"
-        how = "auto-detected" if self.cfg.analyze_for == "auto" else "manual override"
+        """Spell out the two independent facts and the colour they imply."""
+        orient = "White on bottom" if self.cfg.white_bottom else "Black on bottom"
+        seat = "bottom" if self.cfg.player_side != "top" else "top"
+        colour = "White" if self._player_color() == chess.WHITE else "Black"
         self.orientation_label.setText(
-            f"Bottom of board: {side} — you play {side}  ({how}).")
+            f"{orient} (from vision). You sit on the {seat} → you play {colour}.")
 
     def _apply_orientation(self, white_bottom: bool) -> None:
-        """Adopt a board orientation. 'Side on bottom is the player', so this also
-        decides which colour the engine analyses for. Re-runs analysis so the
-        green/red (player/opponent) split flips immediately, not on the next move."""
+        """Adopt a board ORIENTATION (which army is on the bottom). This is vision's
+        job; the only manual entry point is the 'Flip board orientation' fallback for
+        a wrong read. It rotates the drawing AND re-derives your colour, then
+        re-analyses so the green/red split is right immediately."""
         self.cfg.white_bottom = white_bottom
         self.cfg.save()
         if self._geometry is not None:
@@ -630,28 +664,27 @@ class MenuWindow(QtWidgets.QWidget):
         self._refresh_turn_label()
         self._reanalyze_current()
 
-    def _on_side_changed(self, *_) -> None:
-        """'I play as' — Auto-detect follows the calibrated orientation; White/Black
-        force it (and so flip the board). The single orientation/colour control."""
+    def _on_player_side_changed(self, *_) -> None:
+        """Your SEAT (bottom/top). Re-derives your colour and re-runs analysis, but
+        does NOT touch orientation — so the board never flips when you change side."""
         if self._loading:
             return
-        data = self.side_combo.currentData()
-        self.cfg.analyze_for = data
-        if data == "white":
-            wb = True
-        elif data == "black":
-            wb = False
-        else:                              # auto: the side calibration found on the bottom
-            wb = self.vision.white_bottom if self.vision.calibrated else self.cfg.white_bottom
-        self._apply_orientation(wb)
+        self.cfg.player_side = self.player_side_combo.currentData()
+        self.cfg.save()
+        self._refresh_orientation_label()
+        self._refresh_turn_label()
+        self._reanalyze_current()
+
+    def _on_flip_orientation(self) -> None:
+        """Manual fallback when vision read the orientation upside down."""
+        self._apply_orientation(not self.cfg.white_bottom)
+        self.status_label.setText(
+            f"Board orientation flipped — {'White' if self.cfg.white_bottom else 'Black'} on bottom.")
 
     def _adopt_detected_orientation(self, detected: bool) -> None:
-        """Adopt an auto-detected orientation (from calibration / a new game): set
-        'I play as' back to Auto, sync the board, and refresh the label. Does NOT
-        re-analyze (callers do their own restart)."""
-        self.cfg.analyze_for = "auto"
+        """Adopt a vision-detected orientation (from calibration / a new game). Sets
+        only the orientation; your seat is unchanged. Callers re-analyse."""
         self.cfg.white_bottom = detected
-        self._sync_side_combo()
         if self._geometry is not None:
             self._geometry.white_bottom = detected
             self.overlay.set_board_geometry(self._geometry)
@@ -659,13 +692,15 @@ class MenuWindow(QtWidgets.QWidget):
         self._refresh_orientation_label()
 
     def _reconcile_orientation_controls(self) -> None:
-        """At startup make orientation and 'I play as' agree (side on bottom is the
-        player) — a config from before this contract could have them disagree."""
-        if self.cfg.analyze_for == "white":
-            self.cfg.white_bottom = True
-        elif self.cfg.analyze_for == "black":
-            self.cfg.white_bottom = False
-        self._sync_side_combo()
+        """At startup migrate a pre-split config: the old 'I play as black' meant the
+        player sat where black was; map it onto the new seat model (orientation stays
+        whatever vision last saw)."""
+        if self.cfg.analyze_for in ("white", "black"):
+            # old contract: white/black was on the bottom and was the player
+            self.cfg.white_bottom = (self.cfg.analyze_for == "white")
+            self.cfg.player_side = "bottom"
+            self.cfg.analyze_for = "auto"
+        self._sync_player_side_combo()
         self._refresh_orientation_label()
 
     # ----------------------------------------------------- player-eval strength
@@ -801,7 +836,7 @@ class MenuWindow(QtWidgets.QWidget):
         if self._loading:
             return
         # Orientation / player colour and strength are owned by dedicated handlers
-        # (_on_side_changed / _on_strength_*), not read here.
+        # (_on_player_side_changed / _on_strength_*), not read here.
         before = (self.cfg.multipv, self.cfg.engine_depth, self.cfg.engine_mode,
                   self.cfg.gold_moves, self.cfg.show_predicted, self.cfg.opp_lookahead_live,
                   self.cfg.opp_lookahead_depth, self.cfg.opp_lookahead_max)
@@ -1000,14 +1035,15 @@ class MenuWindow(QtWidgets.QWidget):
 
     def _refresh_turn_label(self) -> None:
         side = "White" if self.tracker.board.turn else "Black"
-        self.turn_label.setText(f"To move: {side}" + ("" if self.tracker.turn_known else " (?)"))
+        mine = "you" if self.tracker.board.turn == self._player_color() else "opponent"
+        self.turn_label.setText(
+            f"To move: {side} ({mine})" + ("" if self.tracker.turn_known else "  — uncertain"))
 
-    def _on_flip_turn(self) -> None:
-        # Manual realignment: flip whose turn it is and re-analyze.
-        self.tracker.set_turn(self.tracker.board.turn == chess.BLACK)
+    def _set_turn(self, white_to_move: bool) -> None:
+        """Explicitly pin whose turn it is, then re-analyze."""
+        self.tracker.set_turn(bool(white_to_move))
         self._after_commit()
-        self.status_label.setText(
-            f"Side to move set to {'White' if self.tracker.board.turn else 'Black'}.")
+        self.status_label.setText(f"Set: {'White' if white_to_move else 'Black'} to move.")
 
     def _on_track_toggled(self, on: bool) -> None:
         if self._loading:
@@ -1159,13 +1195,14 @@ class MenuWindow(QtWidgets.QWidget):
         self.status_label.setText("Re-read the board." + note)
 
     def _on_new_game(self) -> None:
-        # Clean reset to a fresh game from move 1. A new game may have flipped your
-        # colour, so return 'I play as' to Auto-detect and re-detect orientation
-        # from the live start position before reseeding.
+        # A new game = the player is on the bottom, and the orientation is re-detected
+        # from the fresh start position. So: seat -> bottom, recalibrate vision (which
+        # sets white_bottom), then reseed from move 1. Your colour falls out of the two.
         if self._controller is not None:
             self._controller.clear()
-        self.cfg.analyze_for = "auto"
-        self._sync_side_combo()
+        self.cfg.player_side = "bottom"
+        self._sync_player_side_combo()
+        self.cfg.save()
         note = self._recalibrate_to_live(require_start=True)
         self._reset_tracking_state()
         self.tracker.reset()                       # start position, White to move
@@ -1173,7 +1210,7 @@ class MenuWindow(QtWidgets.QWidget):
         self.results_list.clear()
         self._after_commit()
         self._refresh_orientation_label()
-        self.status_label.setText("New game — start position." + note)
+        self.status_label.setText("New game — you're on the bottom." + note)
 
     def _refresh_moves(self) -> None:
         self.moves_view.setPlainText(self.tracker.san_line())

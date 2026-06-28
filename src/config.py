@@ -46,7 +46,8 @@ class Config:
 
     # --- preferences (stable across sessions) ---
     board_monitor: int = 0
-    white_bottom: bool = True
+    white_bottom: bool = True        # orientation: is the WHITE army on the bottom? (from vision)
+    player_side: str = "bottom"      # which SEAT you're in: "bottom" | "top" (your colour is derived)
     show_arrows: bool = True
     gold_moves: bool = True           # highlight a clearly-best / forced-mate move in gold
     show_border: bool = False         # draw the calibrated board outline in the overlay
