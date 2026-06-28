@@ -120,5 +120,33 @@ if py:
 else:
     print("  SKIP  maia2 env not installed")
 
+# --- the engine registry / factory ------------------------------------------
+from src.config import Config
+from src.engine_profiles import ENGINE_ORDER, PROFILES, availability, make_controller
+from src.maia2_engine import Maia2Controller as _Maia2
+
+check("three engines registered", set(ENGINE_ORDER) == {"stockfish", "leela", "maia2"})
+check("stockfish/leela display eval, maia2 displays policy",
+      PROFILES["stockfish"].display == "eval" and PROFILES["leela"].display == "eval"
+      and PROFILES["maia2"].display == "policy")
+check("stockfish exposes the Elo limiter, maia2 exposes player/opp Elo",
+      "strength_elo" in PROFILES["stockfish"].features
+      and {"player_elo", "opp_elo"} <= PROFILES["maia2"].features)
+check("stockfish is available", availability("stockfish")[0])
+
+cfg = Config()
+cfg.engine = "stockfish"
+ctrl, _ = make_controller(cfg)
+from src.analysis import EngineController as _Uci
+check("factory builds Stockfish as a UCI controller", isinstance(ctrl, _Uci))
+if availability("leela")[0]:
+    cfg.engine = "leela"
+    ctrl, _ = make_controller(cfg)
+    check("factory builds Leela as a UCI controller", isinstance(ctrl, _Uci))
+if availability("maia2")[0]:
+    cfg.engine = "maia2"
+    ctrl, _ = make_controller(cfg)
+    check("factory builds Maia 2 as the Maia controller", isinstance(ctrl, _Maia2))
+
 print(f"\n{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)
