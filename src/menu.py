@@ -21,6 +21,7 @@ from src.config import Config
 from src.consensus import ConsensusBuffer
 from src.engine import find_stockfish
 from src.openings import identify as identify_opening
+from src.orientation import detect_orientation
 from src.overlay import (Annotation, BoardGeometry, OverlayManager,
                          build_annotations, visible_annotations)
 from src.tracker import GameTracker
@@ -38,6 +39,8 @@ NO_BOARD_FRAMES = 4
 RESYNC_CONFIRM = 2       # stable non-legal reads before resyncing (filters drags)
 MAIA_ELO_MIN = 1100      # Maia 2's trained rating range (values outside clamp)
 MAIA_ELO_MAX = 1900
+ORIENT_FLIP_P = 0.04     # CV must be >=96% sure the orientation is wrong to auto-flip
+ORIENT_FLIP_FRAMES = 4   # confident disagreeing frames required before auto-flipping
 
 
 def _left_mouse_down() -> bool:
@@ -132,6 +135,8 @@ class MenuWindow(QtWidgets.QWidget):
         self._believed: chess.Board | None = None    # what the CV currently sees
         self._consensus = ConsensusBuffer(CONSENSUS_WINDOW)
         self._puzzle_side: bool | None = None        # puzzle: forced side to solve (None = auto)
+        self._orient_belief: tuple = (None, 0.5)     # (CV agrees with active orientation? , confidence)
+        self._orient_votes = 0                       # consecutive confident-disagree frames
 
         self._vision_worker: VisionWorker | None = None
 
@@ -142,6 +147,7 @@ class MenuWindow(QtWidgets.QWidget):
         self.overlay.show()
         self.overlay.set_overlay_visible(self.cfg.show_arrows)
         self.overlay.set_show_border(self.cfg.show_border)
+        self._refresh_orientation_indicator()
         self._refresh_board_status()
         self._refresh_vision_status()
         self._apply_engine_profile()
@@ -198,7 +204,18 @@ class MenuWindow(QtWidgets.QWidget):
         self.gold_moves_cb.setChecked(self.cfg.gold_moves)
         self.show_border_cb = QtWidgets.QCheckBox("Show calibrated board border")
         self.show_border_cb.setChecked(self.cfg.show_border)
-        for cb in (self.show_arrows_cb, self.gold_moves_cb, self.show_border_cb):
+        self.show_orient_cb = QtWidgets.QCheckBox("Show board-direction indicator (W/B side arrow)")
+        self.show_orient_cb.setChecked(self.cfg.show_orientation)
+        self.show_orient_cb.setToolTip(
+            "Draws which way the board faces beside it: cyan = the CV agrees with this "
+            "orientation, amber = it thinks the board is flipped.")
+        self.auto_orient_cb = QtWidgets.QCheckBox("Auto-correct orientation when the CV is confident")
+        self.auto_orient_cb.setChecked(self.cfg.auto_orient)
+        self.auto_orient_cb.setToolTip(
+            "Flip the board automatically when the CV is confident (>=96%, sustained) "
+            "that the current orientation is upside down.")
+        for cb in (self.show_arrows_cb, self.gold_moves_cb, self.show_border_cb,
+                   self.show_orient_cb, self.auto_orient_cb):
             ov.addWidget(cb)
         v.addWidget(overlay)
 
@@ -529,6 +546,7 @@ class MenuWindow(QtWidgets.QWidget):
         self.player_elo_slider.valueChanged.connect(self._on_maia_elo_changed)
         self.opp_elo_slider.valueChanged.connect(self._on_maia_elo_changed)
         for wdg in (self.show_arrows_cb, self.gold_moves_cb, self.show_border_cb,
+                    self.show_orient_cb, self.auto_orient_cb,
                     self.allow_illegal_cb, self.predict_cb, self.pause_drag_cb,
                     self.opp_live_cb):
             wdg.toggled.connect(self._on_settings_changed)
@@ -748,6 +766,9 @@ class MenuWindow(QtWidgets.QWidget):
             self.mini_board.set_board(self._believed, white_bottom)
         self._refresh_orientation_label()
         self._refresh_turn_label()
+        self._orient_belief = (None, 0.5)     # re-evaluated on the next confident frame
+        self._orient_votes = 0
+        self._refresh_orientation_indicator()
         self._reanalyze_current()
 
     def _on_player_colour_changed(self, *_) -> None:
@@ -777,6 +798,9 @@ class MenuWindow(QtWidgets.QWidget):
             self.overlay.set_board_geometry(self._geometry)
         self.cfg.save()
         self._refresh_orientation_label()
+        self._orient_belief = (None, 0.5)
+        self._orient_votes = 0
+        self._refresh_orientation_indicator()
 
     def _reconcile_orientation_controls(self) -> None:
         """Sync the colour / orientation controls to the loaded config at startup."""
@@ -939,6 +963,8 @@ class MenuWindow(QtWidgets.QWidget):
         self.cfg.show_arrows = self.show_arrows_cb.isChecked()
         self.cfg.gold_moves = self.gold_moves_cb.isChecked()
         self.cfg.show_border = self.show_border_cb.isChecked()
+        self.cfg.show_orientation = self.show_orient_cb.isChecked()
+        self.cfg.auto_orient = self.auto_orient_cb.isChecked()
         self.cfg.allow_illegal = self.allow_illegal_cb.isChecked()
         self.cfg.show_predicted = self.predict_cb.isChecked()
         self.cfg.pause_on_drag = self.pause_drag_cb.isChecked()
@@ -948,6 +974,7 @@ class MenuWindow(QtWidgets.QWidget):
         self.cfg.save()
         self.overlay.set_overlay_visible(self.cfg.show_arrows)
         self.overlay.set_show_border(self.cfg.show_border)
+        self._refresh_orientation_indicator()
         sig = (self.cfg.engine_threads, self.cfg.engine_hash_mb)
         if self._controller is not None and sig != self._eng_sig:
             self._eng_sig = sig
@@ -994,6 +1021,8 @@ class MenuWindow(QtWidgets.QWidget):
         self._geometry = result.geometry
         self._cap_region = (result.phys_left, result.phys_top, result.phys_side, result.phys_side)
         self.overlay.set_board_geometry(self._geometry)
+        self._orient_belief = (None, 0.5)
+        self._refresh_orientation_indicator()
         self._refresh_board_status()
         # A (re)calibration is a clean slate: this may be a different board, so
         # drop the old piece templates, tracking state, and arrows.
@@ -1232,6 +1261,7 @@ class MenuWindow(QtWidgets.QWidget):
             if confident:
                 self._no_board = 0
                 self._reconcile(self._believed)
+                self._update_orientation_belief()
             elif frame_cert < NO_BOARD_CERT:
                 self._no_board += 1
                 if self._no_board >= NO_BOARD_FRAMES:    # clearly no board for a while
@@ -1287,6 +1317,38 @@ class MenuWindow(QtWidgets.QWidget):
 
     def _draw_arrows(self) -> None:
         self.overlay.set_annotations(visible_annotations(self._believed, self._suggestions))
+
+    def _refresh_orientation_indicator(self) -> None:
+        show = self.cfg.show_orientation and self._geometry is not None
+        agree, conf = self._orient_belief
+        self.overlay.set_orientation(show, agree, conf)
+
+    def _update_orientation_belief(self) -> None:
+        """Run the chess-reasoning orientation detector on the believed board to (a)
+        drive the overlay indicator and (b) auto-correct the orientation when the CV
+        is confident and sustained that the board is upside down."""
+        board = self._believed
+        if (board is None or board.king(chess.WHITE) is None
+                or board.king(chess.BLACK) is None):
+            return
+        # detect_orientation asks "is White on the LOW ranks of THIS board?". The
+        # believed board is mapped with the active white_bottom, so True => the active
+        # orientation is self-consistent (the CV agrees); p = P(white on bottom).
+        bel_wb, p = detect_orientation(board)
+        agree = bool(bel_wb)
+        self._orient_belief = (agree, p if agree else 1.0 - p)
+        if self.cfg.auto_orient and not agree and p < ORIENT_FLIP_P:
+            self._orient_votes += 1
+            if self._orient_votes >= ORIENT_FLIP_FRAMES:
+                self._orient_votes = 0
+                self._apply_orientation(not self.cfg.white_bottom)   # resets the belief
+                self.status_label.setText(
+                    f"Auto-corrected orientation — "
+                    f"{'White' if self.cfg.white_bottom else 'Black'} on bottom (CV).")
+                return
+        else:
+            self._orient_votes = 0
+        self._refresh_orientation_indicator()
 
     def _recalibrate_to_live(self, require_start: bool) -> str:
         """Best-effort re-calibration to whatever is on screen now (the existing

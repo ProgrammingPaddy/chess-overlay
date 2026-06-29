@@ -58,6 +58,8 @@ class Config:
     show_arrows: bool = True
     gold_moves: bool = True           # highlight a clearly-best / forced-mate move in gold
     show_border: bool = False         # draw the calibrated board outline in the overlay
+    show_orientation: bool = True     # draw the board-direction indicator in the overlay
+    auto_orient: bool = True          # auto-correct orientation when the CV confidently disagrees
     allow_illegal: bool = False      # accept recognized positions even if not a legal move
     show_predicted: bool = True      # show the opponent's best move (red) on their turn
     pause_on_drag: bool = True       # freeze the eval while a piece is held on the board

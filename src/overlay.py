@@ -248,6 +248,7 @@ class _OverlayWindow(QtWidgets.QWidget):
         self._annotations: list[Annotation] = []
         self._visible = True
         self._show_border = False
+        self._orient: tuple | None = None      # (show, agree|None, confidence)
 
         self.setWindowFlags(
             QtCore.Qt.FramelessWindowHint
@@ -279,11 +280,12 @@ class _OverlayWindow(QtWidgets.QWidget):
 
     # --------------------------------------------------------------- state
     def apply(self, geometry: BoardGeometry | None, annotations: list[Annotation],
-              visible: bool, show_border: bool = False) -> None:
+              visible: bool, show_border: bool = False, orient: tuple | None = None) -> None:
         self._geometry = geometry
         self._annotations = annotations
         self._visible = visible
         self._show_border = show_border
+        self._orient = orient
         self.update()
 
     # -------------------------------------------------------------- paint
@@ -300,6 +302,8 @@ class _OverlayWindow(QtWidgets.QWidget):
             painter.translate(-origin.x(), -origin.y())
             if self._show_border:
                 self._draw_border(painter, self._geometry)
+            if self._orient and self._orient[0]:
+                self._draw_orientation(painter, self._geometry, self._orient)
             # Lower-ranked / opponent moves first so the best player move is on top.
             for ann in sorted(self._annotations, key=lambda a: (not a.opponent, -a.rank)):
                 self._draw_move(painter, ann)
@@ -321,6 +325,58 @@ class _OverlayWindow(QtWidgets.QWidget):
             x, y = g.origin_x + k * g.square, g.origin_y + k * g.square
             painter.drawLine(QtCore.QPointF(x, g.origin_y), QtCore.QPointF(x, g.origin_y + side))
             painter.drawLine(QtCore.QPointF(g.origin_x, y), QtCore.QPointF(g.origin_x + side, y))
+
+    @staticmethod
+    def _draw_orientation(painter: QtGui.QPainter, g: BoardGeometry, orient: tuple) -> None:
+        """Side-of-board indicator of which way the board faces: a 'W' disc at White's
+        home end, a 'B' disc at Black's, and an arrow pointing the way White advances.
+        Cyan when the CV agrees with this orientation, amber when it thinks the board
+        is flipped (a hint to flip), dim grey before the first confident read."""
+        _, agree, conf = orient
+        side = g.square * 8.0
+        r = max(7.0, g.square * 0.24)
+        cx = g.origin_x - g.square * 0.62              # left margin, or right if no room
+        if cx - r < 2.0:
+            cx = g.origin_x + side + g.square * 0.62
+        top_y = g.origin_y + r * 1.2
+        bot_y = g.origin_y + side - r * 1.2
+        w_y, b_y = (bot_y, top_y) if g.white_bottom else (top_y, bot_y)   # White's home end
+
+        if agree is None:
+            col = QtGui.QColor(140, 150, 160, 170)
+        elif agree:
+            col = QtGui.QColor(0, 200, 230, int(150 + 105 * max(0.0, min(1.0, conf))))
+        else:
+            col = QtGui.QColor(255, 165, 40, int(150 + 105 * max(0.0, min(1.0, conf))))
+
+        ddir = 1 if b_y > w_y else -1                  # +1: Black below (arrow down)
+        sx, sy, ex, ey = cx, w_y + ddir * r, cx, b_y - ddir * r
+        pen = QtGui.QPen(col, max(2.5, g.square * 0.06))
+        pen.setCapStyle(QtCore.Qt.RoundCap)
+        painter.setPen(pen)
+        painter.setBrush(QtCore.Qt.NoBrush)
+        painter.drawLine(QtCore.QPointF(sx, sy), QtCore.QPointF(ex, ey))
+        ah = g.square * 0.20
+        head = QtGui.QPainterPath(QtCore.QPointF(ex, ey))
+        head.lineTo(ex - ah * 0.6, ey - ddir * ah)
+        head.lineTo(ex + ah * 0.6, ey - ddir * ah)
+        head.closeSubpath()
+        painter.setPen(QtCore.Qt.NoPen)
+        painter.setBrush(col)
+        painter.drawPath(head)
+
+        font = painter.font()
+        font.setPixelSize(max(9, int(r * 1.05)))
+        font.setBold(True)
+        for cy, fill, txt, letter in ((w_y, (245, 245, 245), (20, 20, 20), "W"),
+                                      (b_y, (25, 25, 25), (240, 240, 240), "B")):
+            painter.setBrush(QtGui.QColor(*fill))
+            painter.setPen(QtGui.QPen(col, max(2.0, g.square * 0.04)))
+            painter.drawEllipse(QtCore.QPointF(cx, cy), r, r)
+            painter.setFont(font)
+            painter.setPen(QtGui.QPen(QtGui.QColor(*txt)))
+            painter.drawText(QtCore.QRectF(cx - r, cy - r, 2 * r, 2 * r),
+                             QtCore.Qt.AlignCenter, letter)
 
     def _draw_move(self, painter: QtGui.QPainter, ann: Annotation) -> None:
         g = self._geometry
@@ -390,15 +446,23 @@ class OverlayManager:
         self._annotations: list[Annotation] = []
         self._visible = True
         self._show_border = False
+        self._orient: tuple | None = None
         self._windows = [_OverlayWindow(s) for s in app.screens()]
 
     def _refresh(self) -> None:
         for w in self._windows:
-            w.apply(self._geometry, self._annotations, self._visible, self._show_border)
+            w.apply(self._geometry, self._annotations, self._visible, self._show_border,
+                    self._orient)
 
     def set_show_border(self, show: bool) -> None:
         """Toggle the calibrated board outline (verification aid for both modes)."""
         self._show_border = show
+        self._refresh()
+
+    def set_orientation(self, show: bool, agree: bool | None, confidence: float) -> None:
+        """Update the board-direction indicator. ``agree`` is whether the CV believes
+        the active orientation is correct (None = no confident read yet)."""
+        self._orient = (show, agree, confidence)
         self._refresh()
 
     def set_board_geometry(self, geometry: BoardGeometry) -> None:

@@ -27,6 +27,7 @@ class EngineController(QtCore.QThread):
     ready = QtCore.Signal()
     LOOKAHEAD_DEPTH = 12   # default one-shot / preview opponent look-ahead depth
     LOOKAHEAD_STEP = 2     # depth increment per 'live' refinement round
+    PUZZLE_PREVIEW_DEPTH = 8   # fast both-sides pass to pick the side, then refine
 
     def __init__(self, engine_path: str, threads: int, hash_mb: int, parent=None,
                  extra_options: dict | None = None):
@@ -288,8 +289,13 @@ class EngineController(QtCore.QThread):
         the opponent in check) or has no moves is discarded, which also resolves the
         turn when one side is in check. ``forced_side`` (the user's 'whose turn'
         override) pins the side instead, as long as that side has a legal move. Always
-        full strength."""
+        full strength.
+
+        Like live analysis, it shows a move immediately: a fast low-depth pass on both
+        sides picks the decisive side and emits at once, then THAT side refines (streams
+        deeper, up to ``depth``) while the other side stays as the reds."""
         self._strength_full()
+        preview = max(2, min(self.PUZZLE_PREVIEW_DEPTH, depth))
         best = {}
         for color in (chess.WHITE, chess.BLACK):
             if self._wake.is_set() or self._shutdown:
@@ -297,7 +303,7 @@ class EngineController(QtCore.QThread):
             b = board.copy()
             b.turn = color
             b.clear_stack()
-            best[color] = self._top_moves(b, multipv, depth) if (b.is_valid()
+            best[color] = self._top_moves(b, multipv, preview) if (b.is_valid()
                           and b.legal_moves.count() > 0) else []
         if not best[chess.WHITE] and not best[chess.BLACK]:
             self.updated.emit([], 0, board, [], token)
@@ -312,7 +318,12 @@ class EngineController(QtCore.QThread):
         target = board.copy()
         target.turn = win_color
         target.clear_stack()
-        self.updated.emit(win_sugg, depth, target, lose_sugg, token)
+        self.updated.emit(win_sugg, preview, target, lose_sugg, token)   # instant
+        if self._wake.is_set() or self._shutdown:
+            return
+        # refine the decisive side up to the configured depth, keeping the reds.
+        self._stream_player(target, multipv, "fixed", depth, lose_sugg, token,
+                            min_emit_depth=preview)
 
     def _stream_player(self, target_board: chess.Board, multipv: int, mode: str,
                        depth: int, opp_suggestions: list, token: int,
