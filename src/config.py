@@ -23,7 +23,6 @@ class Config:
     engine_hash_mb: int = 256
     multipv: int = 3                 # number of best moves to show
     engine_mode: str = "live"        # "live" (streaming) | "fixed" (static depth) | "predictive" (reply to each likely opp move)
-    analyze_for: str = "auto"        # "auto" (side on bottom) | "white" | "black"
     # Opponent look-ahead (live & predictive modes): a one-shot preview at
     # opp_lookahead_depth by default; when opp_lookahead_live is on it refines from
     # that depth up to opp_lookahead_max over time. Predictive ALWAYS refines its
@@ -46,27 +45,52 @@ class Config:
 
     # --- preferences (stable across sessions) ---
     board_monitor: int = 0
+    # Orientation and player colour are INDEPENDENT (decoupled on purpose):
+    #   * white_bottom = which army is on the bottom of the SCREEN. Drives vision
+    #     (pixel->square) and the overlay (square->pixel). Detected by vision; the
+    #     "Flip board orientation" button is the manual fallback. It is about the
+    #     screen, never about who you are.
+    #   * player_colour_mode = who YOU play, for the green (mine) / red (opponent)
+    #     split ONLY. "auto" = whoever is on the bottom; "white"/"black" force it.
+    #     Changing it never rotates the board; flipping the board never changes it.
     white_bottom: bool = True        # orientation: is the WHITE army on the bottom? (from vision)
-    player_side: str = "bottom"      # which SEAT you're in: "bottom" | "top" (your colour is derived)
+    player_colour_mode: str = "auto"  # "auto" (bottom army) | "white" | "black"
     show_arrows: bool = True
     gold_moves: bool = True           # highlight a clearly-best / forced-mate move in gold
     show_border: bool = False         # draw the calibrated board outline in the overlay
     allow_illegal: bool = False      # accept recognized positions even if not a legal move
     show_predicted: bool = True      # show the opponent's best move (red) on their turn
     pause_on_drag: bool = True       # freeze the eval while a piece is held on the board
-    # Puzzle mode: treat the position as an isolated puzzle — analyse BOTH sides and
-    # converge on the decisive (side-to-move) side. Eval engines only (not Maia).
-    puzzle_mode: bool = False
-    puzzle_winning_only: bool = False  # show only the winning side's best move (hide the other side)
+    # Play mode is a top-level switch:
+    #   * "live"   = normal play (track the game, show your moves + opponent reds).
+    #   * "puzzle" = treat the on-screen position as an ISOLATED puzzle: analyse both
+    #     sides, converge on the decisive side (the one whose best move wins), and
+    #     show only THAT side's single best move. Eval engines only (not Maia).
+    play_mode: str = "live"          # "live" | "puzzle"
+    puzzle_winning_only: bool = False  # puzzle: show only the winning side's move (hide the other side's)
     auto_track: bool = True          # auto-track the live board (engine analysis on by default)
 
     @classmethod
     def load(cls) -> "Config":
         if CONFIG_PATH.exists():
             data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            cls._migrate(data)
             known = {k: v for k, v in data.items() if k in cls.__dataclass_fields__}
             return cls(**known)
         return cls()
+
+    @staticmethod
+    def _migrate(data: dict) -> None:
+        """Carry forward settings from older config layouts (unknown keys are dropped
+        on load, so legacy ones must be translated here before that)."""
+        # The old puzzle_mode bool became the "puzzle" play_mode.
+        if "play_mode" not in data and data.get("puzzle_mode"):
+            data["play_mode"] = "puzzle"
+        # The old bottom/top seat became an explicit colour. A bottom seat is exactly
+        # what "auto" already does (you're the bottom army); only a top seat needs a
+        # forced colour to preserve the prior derived colour (= the top army).
+        if "player_colour_mode" not in data and data.get("player_side") == "top":
+            data["player_colour_mode"] = "black" if data.get("white_bottom", True) else "white"
 
     def save(self) -> None:
         CONFIG_PATH.write_text(json.dumps(asdict(self), indent=2), encoding="utf-8")

@@ -137,8 +137,9 @@ if sf:
     cpz = _Sf(sf, 2, 64)
     if cpz._spawn_engine():
         cap = {}
-        cpz.updated.connect(lambda s, d, b, o, t: cap.update(s=s, b=b))
-        cpz._analyze_puzzle(chess.Board("6k1/5ppp/8/8/8/8/8/R5K1 w - - 0 1"), 3, 12, 1)
+        cpz.updated.connect(lambda s, d, b, o, t: cap.update(s=s, b=b, o=o))
+        wmate = chess.Board("6k1/5ppp/8/8/8/8/8/R5K1 w - - 0 1")   # White mates with Ra8
+        cpz._analyze_puzzle(wmate, 3, 12, 1)
         check("puzzle converges on White (who is mating)",
               cap.get("b") is not None and cap["b"].turn == chess.WHITE)
         check("puzzle shows White's mating move", cap.get("s")
@@ -149,6 +150,20 @@ if sf:
               cap.get("b") is not None and cap["b"].turn == chess.BLACK)
         check("puzzle shows Black's mating move", cap.get("s")
               and cap["s"][0].move == chess.Move.from_uci("a8a1"))
+        # the 'whose turn' override pins the side even against the eval (force Black on
+        # a White-to-mate position): greens become a Black move, reds stay White's mate.
+        cap.clear()
+        cpz._analyze_puzzle(wmate, 1, 12, 3, forced_side=chess.BLACK)
+        check("forced-side puzzle solves for the chosen side (Black)",
+              cap.get("b") is not None and cap["b"].turn == chess.BLACK)
+        check("forced-side puzzle shows a Black move", cap.get("s")
+              and cap["b"].piece_at(cap["s"][0].move.from_square).color == chess.BLACK)
+        check("forced-side puzzle keeps the other side (White) as the reds",
+              cap.get("o") and cap["o"][0].move == chess.Move.from_uci("a1a8"))
+        # a puzzle is a single answer: multipv=1 yields exactly one green.
+        cap.clear()
+        cpz._analyze_puzzle(wmate, 1, 12, 4)
+        check("puzzle with multipv=1 shows a single best move", len(cap.get("s") or []) == 1)
         cpz._quit_engine()
     else:
         print("  SKIP  stockfish puzzle (spawn failed)")

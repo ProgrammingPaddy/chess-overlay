@@ -56,12 +56,15 @@ class EngineController(QtCore.QThread):
                 player_color: bool | None = None, token: int = 0,
                 opp_live: bool = False, opp_depth: int = 12, opp_max: int = 22,
                 limit_strength: bool = False, player_elo: int = 1500,
-                opp_elo: int = 1500, puzzle: bool = False) -> None:
+                opp_elo: int = 1500, puzzle: bool = False,
+                puzzle_side: bool | None = None) -> None:
         # opp_elo is part of the shared engine interface (used by the Maia 2
-        # controller); the search engines ignore it.
+        # controller); the search engines ignore it. puzzle_side (None = auto-pick the
+        # decisive side; True/False = solve for White/Black) only applies when puzzle.
         with self._lock:
             self._pending = (board.copy(), multipv, mode, depth, player_color, token,
-                             opp_live, opp_depth, opp_max, limit_strength, player_elo, puzzle)
+                             opp_live, opp_depth, opp_max, limit_strength, player_elo,
+                             puzzle, puzzle_side)
         self._interrupt()
 
     def clear(self) -> None:
@@ -237,7 +240,7 @@ class EngineController(QtCore.QThread):
                  player_color: bool | None = None, token: int = 0,
                  opp_live: bool = False, opp_depth: int = 12, opp_max: int = 22,
                  limit_strength: bool = False, player_elo: int = 1500,
-                 puzzle: bool = False) -> None:
+                 puzzle: bool = False, puzzle_side: bool | None = None) -> None:
         # Tempo model:
         #   * player to move  -> analyse the CURRENT position for the player.
         #   * opponent to move -> look ahead (see _analyze_opponent_turn): the
@@ -249,7 +252,7 @@ class EngineController(QtCore.QThread):
         # prediction always stays full strength. Applied per-analysis below.
         self._strength = (bool(limit_strength), int(player_elo))
         if puzzle:
-            self._analyze_puzzle(board, multipv, depth, token)
+            self._analyze_puzzle(board, multipv, depth, token, puzzle_side)
             return
         if board.legal_moves.count() == 0:
             self.updated.emit([], 0, board, [], token)
@@ -276,13 +279,16 @@ class EngineController(QtCore.QThread):
             return 1e6 - s.mate_in if s.mate_in > 0 else -1e6 - s.mate_in
         return float(s.score_cp) if s.score_cp is not None else 0.0
 
-    def _analyze_puzzle(self, board: chess.Board, multipv: int, depth: int, token: int) -> None:
+    def _analyze_puzzle(self, board: chess.Board, multipv: int, depth: int, token: int,
+                        forced_side: bool | None = None) -> None:
         """Puzzle mode: treat the position as isolated and work out whose move it is by
-        analysing BOTH sides, then show the decisive (side-to-move) side's best move(s)
-        as the greens and the other side's as the reds. The side to move is the one
-        whose best move is more decisive in their favour; a side that is illegal to
-        move (would leave the opponent in check) or has no moves is discarded, which
-        also resolves the turn when one side is in check. Always full strength."""
+        analysing BOTH sides, then show the side-to-move's best move(s) as the greens
+        and the other side's as the reds. The side to move is the one whose best move
+        is more decisive in their favour; a side that is illegal to move (would leave
+        the opponent in check) or has no moves is discarded, which also resolves the
+        turn when one side is in check. ``forced_side`` (the user's 'whose turn'
+        override) pins the side instead, as long as that side has a legal move. Always
+        full strength."""
         self._strength_full()
         best = {}
         for color in (chess.WHITE, chess.BLACK):
@@ -293,14 +299,16 @@ class EngineController(QtCore.QThread):
             b.clear_stack()
             best[color] = self._top_moves(b, multipv, depth) if (b.is_valid()
                           and b.legal_moves.count() > 0) else []
-        white_sugg, black_sugg = best[chess.WHITE], best[chess.BLACK]
-        if not white_sugg and not black_sugg:
+        if not best[chess.WHITE] and not best[chess.BLACK]:
             self.updated.emit([], 0, board, [], token)
             return
-        if self._side_value(white_sugg) >= self._side_value(black_sugg):
-            win_color, win_sugg, lose_sugg = chess.WHITE, white_sugg, black_sugg
+        if forced_side is not None and best[bool(forced_side)]:
+            win_color = bool(forced_side)            # honour the override when it can move
+        elif self._side_value(best[chess.WHITE]) >= self._side_value(best[chess.BLACK]):
+            win_color = chess.WHITE
         else:
-            win_color, win_sugg, lose_sugg = chess.BLACK, black_sugg, white_sugg
+            win_color = chess.BLACK
+        win_sugg, lose_sugg = best[win_color], best[not win_color]
         target = board.copy()
         target.turn = win_color
         target.clear_stack()

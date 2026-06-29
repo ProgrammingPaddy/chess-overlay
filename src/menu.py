@@ -131,6 +131,7 @@ class MenuWindow(QtWidgets.QWidget):
         self._suggestions: list[Annotation] = []    # latest engine arrows (pre-filter)
         self._believed: chess.Board | None = None    # what the CV currently sees
         self._consensus = ConsensusBuffer(CONSENSUS_WINDOW)
+        self._puzzle_side: bool | None = None        # puzzle: forced side to solve (None = auto)
 
         self._vision_worker: VisionWorker | None = None
 
@@ -147,6 +148,7 @@ class MenuWindow(QtWidgets.QWidget):
         self._sync_maia_controls()
         self._init_controller()
         self._reconcile_orientation_controls()
+        self._apply_play_mode()
         self._sync_strength_controls()
         self._loading = False
 
@@ -362,29 +364,48 @@ class MenuWindow(QtWidgets.QWidget):
     def _tab_play(self) -> QtWidgets.QWidget:
         w = QtWidgets.QWidget()
         v = QtWidgets.QVBoxLayout(w)
-        # Seat & orientation. These are INDEPENDENT: orientation (which army is on the
-        # bottom) is detected by vision; your seat (bottom/top) is where you sit. Your
-        # colour is derived, so changing seat never rotates the board.
-        seat = QtWidgets.QGroupBox("Seat && orientation")
-        sf = QtWidgets.QFormLayout(seat)
-        self.player_side_combo = QtWidgets.QComboBox()
-        self.player_side_combo.addItem("I'm on the bottom (default)", "bottom")
-        self.player_side_combo.addItem("I'm on the top", "top")
-        self.player_side_combo.setCurrentIndex(
-            max(0, self.player_side_combo.findData(self.cfg.player_side)))
-        self.player_side_combo.setToolTip(
-            "Which side of the board YOU sit on. Your colour follows the pieces on "
-            "that side — this never rotates the board.")
-        sf.addRow("Player side", self.player_side_combo)
+        # Play mode — a top-level switch between normal play and isolated puzzles.
+        mode = QtWidgets.QGroupBox("Play mode")
+        mrow = QtWidgets.QHBoxLayout(mode)
+        self.mode_live_radio = QtWidgets.QRadioButton("Live play")
+        self.mode_puzzle_radio = QtWidgets.QRadioButton("Puzzle")
+        self.mode_live_radio.setToolTip(
+            "Track the live game: your moves (green) and the opponent's likely reply (red).")
+        self.mode_puzzle_radio.setToolTip(
+            "Treat the on-screen position as an isolated puzzle: find the decisive side "
+            "and show its single best move. Eval engines only (Stockfish / Leela).")
+        (self.mode_puzzle_radio if self.cfg.play_mode == "puzzle"
+         else self.mode_live_radio).setChecked(True)
+        mrow.addWidget(self.mode_live_radio)
+        mrow.addWidget(self.mode_puzzle_radio)
+        mrow.addStretch(1)
+        v.addWidget(mode)
+
+        # Player colour and board orientation are INDEPENDENT. Colour sets the
+        # green (mine) / red (opponent) split; orientation is purely how the board is
+        # read and drawn. Neither control touches the other.
+        colour = QtWidgets.QGroupBox("Player colour && board")
+        cf = QtWidgets.QFormLayout(colour)
+        self.player_colour_combo = QtWidgets.QComboBox()
+        self.player_colour_combo.addItem("Auto (whoever's on the bottom)", "auto")
+        self.player_colour_combo.addItem("I'm White", "white")
+        self.player_colour_combo.addItem("I'm Black", "black")
+        self.player_colour_combo.setCurrentIndex(
+            max(0, self.player_colour_combo.findData(self.cfg.player_colour_mode)))
+        self.player_colour_combo.setToolTip(
+            "Who YOU play — sets which moves are green (yours) vs red (opponent's). "
+            "This never rotates the board.")
+        cf.addRow("Playing as", self.player_colour_combo)
         self.orientation_label = QtWidgets.QLabel()
         self.orientation_label.setWordWrap(True)
-        sf.addRow(self.orientation_label)
+        cf.addRow(self.orientation_label)
         self.flip_orient_btn = QtWidgets.QPushButton("Flip board orientation (if vision read it upside down)")
         self.flip_orient_btn.setToolTip(
-            "Fallback only — rotates the board 180°. Normally orientation is detected "
-            "automatically; recalibrating vision is the cleaner fix.")
-        sf.addRow(self.flip_orient_btn)
-        v.addWidget(seat)
+            "Rotates how the board is read and drawn 180° — use if the arrows/pieces look "
+            "upside down. Does NOT change who you're playing as. Recalibrating vision is "
+            "the cleaner fix.")
+        cf.addRow(self.flip_orient_btn)
+        v.addWidget(colour)
 
         # Whose turn — the weakest signal, so make it explicit and overridable.
         turn = QtWidgets.QGroupBox("Whose turn")
@@ -400,8 +421,9 @@ class MenuWindow(QtWidgets.QWidget):
             trow.addWidget(b)
         tf.addLayout(trow)
         turn_note = QtWidgets.QLabel(
-            "Turn is inferred from your moves; correct it here if the tracker drifts. "
-            "'My/Opponent's move' set it relative to your colour.")
+            "Live: correct whose turn it is if the tracker drifts ('My/Opponent's move' "
+            "are relative to your colour). Puzzle: these force which side to solve for, "
+            "overriding the auto-picked side.")
         turn_note.setWordWrap(True)
         tf.addWidget(turn_note)
         v.addWidget(turn)
@@ -418,20 +440,24 @@ class MenuWindow(QtWidgets.QWidget):
         opts.addWidget(self.pause_drag_cb)
         v.addLayout(opts)
 
-        # Puzzle mode — treat the position as an isolated puzzle.
-        puzzle = QtWidgets.QGroupBox("Puzzle mode")
-        pf = QtWidgets.QVBoxLayout(puzzle)
-        self.puzzle_cb = QtWidgets.QCheckBox("Puzzle mode (analyse both sides, find the side to move)")
-        self.puzzle_cb.setChecked(self.cfg.puzzle_mode)
-        self.puzzle_cb.setToolTip(
-            "For tactics puzzles with no move history: analyses the position as both "
-            "White-to-move and Black-to-move and shows the decisive side's best move. "
-            "Eval engines only (Stockfish / Leela).")
-        pf.addWidget(self.puzzle_cb)
-        self.puzzle_winning_cb = QtWidgets.QCheckBox("Show only the winning side's best move")
+        # Puzzle options — only meaningful in Puzzle mode (disabled in Live play).
+        self.puzzle_group = QtWidgets.QGroupBox("Puzzle options")
+        pf = QtWidgets.QVBoxLayout(self.puzzle_group)
+        self.puzzle_winning_cb = QtWidgets.QCheckBox(
+            "Show only the winning side's move (hide the other side's)")
         self.puzzle_winning_cb.setChecked(self.cfg.puzzle_winning_only)
         pf.addWidget(self.puzzle_winning_cb)
-        v.addWidget(puzzle)
+        self.puzzle_auto_btn = QtWidgets.QPushButton("Auto-pick the side to solve")
+        self.puzzle_auto_btn.setToolTip(
+            "Let the engine pick the decisive side. The 'Whose turn' buttons override "
+            "this (force White/Black to move); this clears that override.")
+        pf.addWidget(self.puzzle_auto_btn)
+        self.puzzle_note = QtWidgets.QLabel(
+            "Analyses the position as both sides and shows the decisive side's single "
+            "best move. Eval engines only (Stockfish / Leela).")
+        self.puzzle_note.setWordWrap(True)
+        pf.addWidget(self.puzzle_note)
+        v.addWidget(self.puzzle_group)
 
         self.fen_edit = QtWidgets.QLineEdit(chess.STARTING_FEN)
         v.addWidget(self.fen_edit)
@@ -482,15 +508,17 @@ class MenuWindow(QtWidgets.QWidget):
         self.track_cb.toggled.connect(self._on_track_toggled)
         self.reset_game_btn.clicked.connect(self._on_reset_game)
         self.newgame_btn.clicked.connect(self._on_new_game)
-        # Seat (re-derives colour, never rotates) + manual orientation fallback.
-        self.player_side_combo.currentIndexChanged.connect(self._on_player_side_changed)
+        # Player colour (green/red split only — never rotates) + orientation fallback.
+        self.player_colour_combo.currentIndexChanged.connect(self._on_player_colour_changed)
         self.flip_orient_btn.clicked.connect(self._on_flip_orientation)
-        # Explicit turn controls.
+        # Explicit turn controls (live: pin whose turn; puzzle: force the side to solve).
         self.turn_white_btn.clicked.connect(lambda: self._set_turn(True))
         self.turn_black_btn.clicked.connect(lambda: self._set_turn(False))
         self.turn_mine_btn.clicked.connect(lambda: self._set_turn(self._player_color() == chess.WHITE))
         self.turn_opp_btn.clicked.connect(lambda: self._set_turn(self._player_color() != chess.WHITE))
-        self.puzzle_cb.toggled.connect(self._on_puzzle_toggled)
+        # Play mode (Live / Puzzle) + puzzle options.
+        self.mode_puzzle_radio.toggled.connect(self._on_play_mode_changed)
+        self.puzzle_auto_btn.clicked.connect(self._on_puzzle_auto)
         self.puzzle_winning_cb.toggled.connect(self._on_puzzle_winning_toggled)
         self.strength_preset.currentIndexChanged.connect(self._on_strength_preset)
         self.strength_slider.valueChanged.connect(self._on_strength_slider)
@@ -624,7 +652,12 @@ class MenuWindow(QtWidgets.QWidget):
         self._reanalyze_current()               # Elos are per-request; no rebuild needed
 
     def _start_analysis(self, board: chess.Board) -> None:
-        if not board.is_valid():
+        puzzle = self.cfg.play_mode == "puzzle" and not self._is_policy_engine()  # eval engines only
+        # Puzzle mode picks the side itself (it analyses each colour), so the
+        # tracker's assumed turn can make the position 'invalid' (the side not to
+        # move is in check) while it is still a perfectly good puzzle — skip the
+        # live-play legality gate for it.
+        if not puzzle and not board.is_valid():
             kings_ok = (board.king(chess.WHITE) is not None
                         and board.king(chess.BLACK) is not None)
             if not (self.cfg.allow_illegal and kings_ok):
@@ -647,23 +680,26 @@ class MenuWindow(QtWidgets.QWidget):
             limit, p_elo, o_elo = False, self.cfg.maia_player_elo, self.cfg.maia_opp_elo
         else:
             limit, p_elo, o_elo = self.cfg.limit_player_strength, self.cfg.player_elo, self.cfg.maia_opp_elo
-        puzzle = self.cfg.puzzle_mode and not self._is_policy_engine()   # eval engines only
-        self._controller.request(board, self.cfg.multipv, self.cfg.engine_mode,
+        multipv = 1 if puzzle else self.cfg.multipv    # a puzzle has a single answer
+        self._controller.request(board, multipv, self.cfg.engine_mode,
                                  self.cfg.engine_depth, self._player_color(), self._req_id,
                                  self.cfg.opp_lookahead_live, self.cfg.opp_lookahead_depth,
-                                 self.cfg.opp_lookahead_max, limit, p_elo, o_elo, puzzle)
+                                 self.cfg.opp_lookahead_max, limit, p_elo, o_elo, puzzle,
+                                 self._puzzle_side if puzzle else None)
         self.stop_btn.setEnabled(True)
 
     def _player_color(self) -> bool:
-        """Which colour the human plays — DERIVED, never set directly.
-
-        Two independent facts: the board ORIENTATION (``white_bottom``, detected by
-        vision — which army is on the bottom) and your SEAT (``player_side``, where
-        you sit, default bottom). Your colour is simply whoever's army is on your
-        side. Because colour is derived, picking your side never rotates the board
-        (that was the old 'I play as' bug)."""
-        player_on_bottom = (self.cfg.player_side != "top")
-        return chess.WHITE if (self.cfg.white_bottom == player_on_bottom) else chess.BLACK
+        """Which colour the human plays — for the green (mine) / red (opponent) split
+        ONLY. Independent of board orientation: ``"auto"`` means you're whoever is on
+        the bottom of the screen (the usual case); ``"white"``/``"black"`` force it.
+        Changing this never rotates the board, and flipping the board never changes a
+        forced colour (on ``"auto"`` the 'bottom army' naturally follows the flip)."""
+        mode = self.cfg.player_colour_mode
+        if mode == "white":
+            return chess.WHITE
+        if mode == "black":
+            return chess.BLACK
+        return chess.WHITE if self.cfg.white_bottom else chess.BLACK
 
     def _stop_analysis(self) -> None:
         if self._controller is not None:
@@ -683,20 +719,20 @@ class MenuWindow(QtWidgets.QWidget):
         self._analyzing_key = None        # defeat the unchanged-position guard
         self._start_analysis(board)
 
-    # ------------------------------------------------- orientation / seat / side
-    def _sync_player_side_combo(self) -> None:
-        self.player_side_combo.blockSignals(True)
-        self.player_side_combo.setCurrentIndex(
-            max(0, self.player_side_combo.findData(self.cfg.player_side)))
-        self.player_side_combo.blockSignals(False)
+    # ----------------------------------------------- orientation / player colour
+    def _sync_player_colour_combo(self) -> None:
+        self.player_colour_combo.blockSignals(True)
+        self.player_colour_combo.setCurrentIndex(
+            max(0, self.player_colour_combo.findData(self.cfg.player_colour_mode)))
+        self.player_colour_combo.blockSignals(False)
 
     def _refresh_orientation_label(self) -> None:
-        """Spell out the two independent facts and the colour they imply."""
+        """Spell out the two independent facts: how the board is read, and who you play."""
         orient = "White on bottom" if self.cfg.white_bottom else "Black on bottom"
-        seat = "bottom" if self.cfg.player_side != "top" else "top"
         colour = "White" if self._player_color() == chess.WHITE else "Black"
+        how = "auto" if self.cfg.player_colour_mode == "auto" else "you set"
         self.orientation_label.setText(
-            f"{orient} (from vision). You sit on the {seat} → you play {colour}.")
+            f"Board read {orient} (vision). You play {colour} ({how}) → your moves are green.")
 
     def _apply_orientation(self, white_bottom: bool) -> None:
         """Adopt a board ORIENTATION (which army is on the bottom). This is vision's
@@ -714,12 +750,13 @@ class MenuWindow(QtWidgets.QWidget):
         self._refresh_turn_label()
         self._reanalyze_current()
 
-    def _on_player_side_changed(self, *_) -> None:
-        """Your SEAT (bottom/top). Re-derives your colour and re-runs analysis, but
-        does NOT touch orientation — so the board never flips when you change side."""
+    def _on_player_colour_changed(self, *_) -> None:
+        """Your COLOUR (auto / white / black) — sets the green/red split and re-runs
+        analysis. NEVER touches orientation, so the board never flips when you change
+        who you're playing as."""
         if self._loading:
             return
-        self.cfg.player_side = self.player_side_combo.currentData()
+        self.cfg.player_colour_mode = self.player_colour_combo.currentData()
         self.cfg.save()
         self._refresh_orientation_label()
         self._refresh_turn_label()
@@ -742,15 +779,8 @@ class MenuWindow(QtWidgets.QWidget):
         self._refresh_orientation_label()
 
     def _reconcile_orientation_controls(self) -> None:
-        """At startup migrate a pre-split config: the old 'I play as black' meant the
-        player sat where black was; map it onto the new seat model (orientation stays
-        whatever vision last saw)."""
-        if self.cfg.analyze_for in ("white", "black"):
-            # old contract: white/black was on the bottom and was the player
-            self.cfg.white_bottom = (self.cfg.analyze_for == "white")
-            self.cfg.player_side = "bottom"
-            self.cfg.analyze_for = "auto"
-        self._sync_player_side_combo()
+        """Sync the colour / orientation controls to the loaded config at startup."""
+        self._sync_player_colour_combo()
         self._refresh_orientation_label()
 
     # ----------------------------------------------------- player-eval strength
@@ -832,7 +862,7 @@ class MenuWindow(QtWidgets.QWidget):
             return
         try:
             policy = self._is_policy_engine()    # Maia: show human-move probabilities
-            puzzle = self.cfg.puzzle_mode and not policy
+            puzzle = self.cfg.play_mode == "puzzle" and not policy
             # In puzzle mode the greens are the (engine-determined) side-to-move's best
             # and the reds are the other side; 'winning side only' hides the reds.
             show_opp = (not self.cfg.puzzle_winning_only) if puzzle else self.cfg.show_predicted
@@ -853,9 +883,10 @@ class MenuWindow(QtWidgets.QWidget):
                 self.status_label.setText(self._terminal_status(board, opp_suggestions))
             elif puzzle:
                 side = "White" if board.turn == chess.WHITE else "Black"
-                extra = "" if self.cfg.puzzle_winning_only else f" (other side's best in red)"
+                how = "you forced" if self._puzzle_side is not None else "decisive side"
+                extra = "" if self.cfg.puzzle_winning_only else " — other side's best in red"
                 self.status_label.setText(
-                    f"Puzzle — {side} to move & winning. Best for {side}.{extra}")
+                    f"Puzzle — {side} to move ({how}). Best move for {side}{extra}.")
             else:
                 note = ""
                 if opp_suggestions:
@@ -895,7 +926,7 @@ class MenuWindow(QtWidgets.QWidget):
         if self._loading:
             return
         # Orientation / player colour and strength are owned by dedicated handlers
-        # (_on_player_side_changed / _on_strength_*), not read here.
+        # (_on_player_colour_changed / _on_strength_*), not read here.
         before = (self.cfg.multipv, self.cfg.engine_depth, self.cfg.engine_mode,
                   self.cfg.gold_moves, self.cfg.show_predicted, self.cfg.opp_lookahead_live,
                   self.cfg.opp_lookahead_depth, self.cfg.opp_lookahead_max)
@@ -1088,30 +1119,67 @@ class MenuWindow(QtWidgets.QWidget):
         self._suggestions = []
         self._believed = None
         self._consensus.clear()
+        self._puzzle_side = None        # a fresh position re-auto-picks the puzzle side
 
     def _update_certainty(self, conf: float) -> None:
         self.certainty_bar.setValue(int(round(conf * 100)))
 
     def _refresh_turn_label(self) -> None:
+        if self.cfg.play_mode == "puzzle":
+            if self._puzzle_side is None:
+                self.turn_label.setText("Solving: auto (the decisive side)")
+            else:
+                self.turn_label.setText(
+                    f"Solving: {'White' if self._puzzle_side else 'Black'} to move (you forced)")
+            return
         side = "White" if self.tracker.board.turn else "Black"
         mine = "you" if self.tracker.board.turn == self._player_color() else "opponent"
         self.turn_label.setText(
             f"To move: {side} ({mine})" + ("" if self.tracker.turn_known else "  — uncertain"))
 
     def _set_turn(self, white_to_move: bool) -> None:
-        """Explicitly pin whose turn it is, then re-analyze."""
+        """The 'whose turn' buttons. Live: pin whose turn it is on the tracker. Puzzle:
+        force which side we solve for (overriding the auto-picked decisive side)."""
+        if self.cfg.play_mode == "puzzle":
+            self._puzzle_side = bool(white_to_move)
+            self._refresh_turn_label()
+            self._reanalyze_current()
+            self.status_label.setText(
+                f"Puzzle — solving for {'White' if white_to_move else 'Black'}.")
+            return
         self.tracker.set_turn(bool(white_to_move))
         self._after_commit()
         self.status_label.setText(f"Set: {'White' if white_to_move else 'Black'} to move.")
 
-    def _on_puzzle_toggled(self, on: bool) -> None:
+    def _apply_play_mode(self) -> None:
+        """Reflect the active play mode in the UI: the puzzle options are live only in
+        puzzle mode, and the opponent-reds toggle is a live-play concept."""
+        puzzle = self.cfg.play_mode == "puzzle"
+        self.puzzle_group.setEnabled(puzzle)
+        self.predict_cb.setEnabled(not puzzle)
+        self._refresh_turn_label()
+
+    def _on_play_mode_changed(self, *_) -> None:
         if self._loading:
             return
-        self.cfg.puzzle_mode = on
+        self.cfg.play_mode = "puzzle" if self.mode_puzzle_radio.isChecked() else "live"
         self.cfg.save()
-        if on and self._is_policy_engine():
-            self.status_label.setText("Puzzle mode needs an eval engine (Stockfish or Leela) — Maia plays normally.")
+        self._puzzle_side = None                     # a fresh mode auto-picks the side
+        self._apply_play_mode()
+        if self.cfg.play_mode == "puzzle" and self._is_policy_engine():
+            self.status_label.setText(
+                "Puzzle mode needs an eval engine (Stockfish or Leela) — Maia plays normally.")
+        elif self.cfg.play_mode == "puzzle":
+            self.status_label.setText("Puzzle mode — solving the on-screen position.")
+        else:
+            self.status_label.setText("Live play.")
         self._reanalyze_current()
+
+    def _on_puzzle_auto(self) -> None:
+        self._puzzle_side = None
+        self._refresh_turn_label()
+        self._reanalyze_current()
+        self.status_label.setText("Puzzle — auto-picking the decisive side.")
 
     def _on_puzzle_winning_toggled(self, on: bool) -> None:
         if self._loading:
@@ -1270,13 +1338,13 @@ class MenuWindow(QtWidgets.QWidget):
         self.status_label.setText("Re-read the board." + note)
 
     def _on_new_game(self) -> None:
-        # A new game = the player is on the bottom, and the orientation is re-detected
-        # from the fresh start position. So: seat -> bottom, recalibrate vision (which
-        # sets white_bottom), then reseed from move 1. Your colour falls out of the two.
+        # A new game = re-detect orientation from the fresh start position and let your
+        # colour follow whoever is on the bottom. So: colour -> auto, recalibrate vision
+        # (which sets white_bottom), then reseed from move 1.
         if self._controller is not None:
             self._controller.clear()
-        self.cfg.player_side = "bottom"
-        self._sync_player_side_combo()
+        self.cfg.player_colour_mode = "auto"
+        self._sync_player_colour_combo()
         self.cfg.save()
         note = self._recalibrate_to_live(require_start=True)
         self._reset_tracking_state()
@@ -1285,7 +1353,7 @@ class MenuWindow(QtWidgets.QWidget):
         self.results_list.clear()
         self._after_commit()
         self._refresh_orientation_label()
-        self.status_label.setText("New game — you're on the bottom." + note)
+        self.status_label.setText("New game — colour auto-set from the board." + note)
 
     def _refresh_moves(self) -> None:
         self.moves_view.setPlainText(self.tracker.san_line())
