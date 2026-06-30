@@ -208,7 +208,10 @@ class EngineController(QtCore.QThread):
         candidates (reds) and the player's look-ahead replies."""
         latest: dict[int, dict] = {}
         try:
-            with self._engine.analysis(board, multipv=multipv,
+            # python-chess parses PVs against this board in ITS OWN background thread;
+            # hand it a private copy so that thread never shares a chess.Board with this
+            # controller (concurrent push/pop corrupts the move stack -> segfault).
+            with self._engine.analysis(board.copy(), multipv=multipv,
                                        limit=chess.engine.Limit(depth=depth)) as analysis:
                 self._analysis = analysis
                 for info in analysis:
@@ -362,7 +365,8 @@ class EngineController(QtCore.QThread):
         limit = chess.engine.Limit(depth=depth) if mode == "fixed" else None
         latest: dict[int, dict] = {}
         last_emit = min_emit_depth
-        with self._engine.analysis(target_board, multipv=multipv, limit=limit) as analysis:
+        # private copy for python-chess's background PV parser (see _top_moves).
+        with self._engine.analysis(target_board.copy(), multipv=multipv, limit=limit) as analysis:
             self._analysis = analysis
             for info in analysis:
                 if self._wake.is_set() or self._shutdown:
