@@ -27,7 +27,7 @@ class EngineController(QtCore.QThread):
     ready = QtCore.Signal()
     LOOKAHEAD_DEPTH = 12   # default one-shot / preview opponent look-ahead depth
     LOOKAHEAD_STEP = 2     # depth increment per 'live' refinement round
-    PUZZLE_PREVIEW_DEPTH = 8   # fast both-sides pass to pick the side, then refine
+    PUZZLE_PREVIEW_DEPTH = 10  # fast both-sides pass to pick the side, then refine
 
     def __init__(self, engine_path: str, threads: int, hash_mb: int, parent=None,
                  extra_options: dict | None = None):

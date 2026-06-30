@@ -1293,10 +1293,17 @@ class MenuWindow(QtWidgets.QWidget):
             if self._resync_count >= RESYNC_CONFIRM:
                 self.tracker.reset(board, previous=self.tracker.board.copy())
                 self._resync_fen = None
+                self._puzzle_side = None       # a board jump = a new puzzle; re-guess the side
                 self._after_commit()
                 self.status_label.setText("Resynced to the current board.")
             return
         # Legal move, or no change: the tracker now matches the board.
+        if moves and self.cfg.play_mode == "puzzle":
+            # A real move tells us whose turn it actually is now, so make green that
+            # side for the REST OF THIS PUZZLE — this corrects a wrong auto-guess once
+            # you play the right move. Cleared on the next board jump (new puzzle); the
+            # field is read only in puzzle mode, so it never bleeds into live play.
+            self._puzzle_side = self.tracker.board.turn
         self._resync_fen = None
         self._after_commit()
 
@@ -1306,14 +1313,22 @@ class MenuWindow(QtWidgets.QWidget):
 
     def _after_commit(self) -> None:
         """Keep the analysed position in step with the board. Re-analyses only
-        when the position actually changes, so a stable one keeps deepening. The
-        turn is always resolved (diff-inferred), so arrows never blank out."""
+        when the position actually changes, so a stable one keeps deepening."""
         board = self.tracker.board
         self._refresh_turn_label()
-        if self._pos_key(board) != self._analyzing_key:
+        # Live play, whose-turn still unknown (a cold mid-game reseed with no observed
+        # move): assume it's YOUR move — you consult the overlay about your own move —
+        # until a real move resolves it. This never marks the turn 'known', so an
+        # observed move still corrects it; puzzle mode resolves the side itself.
+        analyse = board
+        if (self.cfg.play_mode != "puzzle" and not self.tracker.turn_known
+                and board.turn != self._player_color()):
+            analyse = board.copy()
+            analyse.turn = self._player_color()
+        if self._pos_key(analyse) != self._analyzing_key:
             self._refresh_moves()
-            self.fen_edit.setText(board.fen())
-            self._start_analysis(board)
+            self.fen_edit.setText(analyse.fen())
+            self._start_analysis(analyse)
 
     def _draw_arrows(self) -> None:
         self.overlay.set_annotations(visible_annotations(self._believed, self._suggestions))
