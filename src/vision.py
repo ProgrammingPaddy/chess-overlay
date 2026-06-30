@@ -170,6 +170,33 @@ class VisionModel:
                   white_bottom: bool | None = None) -> chess.Board:
         return self.analyze(board_img, white_bottom)[0]
 
+    # ----- persistence (saved 'themes') -----
+    def save(self, path) -> None:
+        """Persist the learned templates to ``path`` (a piece 'theme'). Portable across
+        board pixel SIZES: matching resizes every cell to a fixed N px before comparing,
+        so templates learned at one board size still match at another."""
+        syms = list(self.sprites.keys())
+        np.savez_compressed(
+            str(path),
+            empty_light=self.empty[True], empty_dark=self.empty[False],
+            occ_thresh=np.asarray(self.occ_thresh, np.float32),
+            white_bottom=np.asarray(1 if self.white_bottom else 0, np.int8),
+            symbols=np.asarray("".join(syms)),
+            **{f"sprite_{i}": self.sprites[s] for i, s in enumerate(syms)},
+        )
+
+    @classmethod
+    def load(cls, path) -> "VisionModel":
+        d = np.load(str(path), allow_pickle=False)
+        m = cls()
+        m.empty = {True: d["empty_light"], False: d["empty_dark"]}
+        m.occ_thresh = float(d["occ_thresh"])
+        m.white_bottom = bool(int(d["white_bottom"]))
+        syms = str(d["symbols"])
+        m.sprites = {s: d[f"sprite_{i}"] for i, s in enumerate(syms)}
+        m.calibrated = bool(m.sprites)
+        return m
+
 
 def certainty(debug: list[dict]) -> float:
     if not debug:

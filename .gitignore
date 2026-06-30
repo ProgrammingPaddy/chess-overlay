@@ -22,3 +22,6 @@ debug/
 
 # Stale local artifact (old vision template dump; nothing loads it)
 *.npz
+
+# saved piece themes (user vision data)
+themes/

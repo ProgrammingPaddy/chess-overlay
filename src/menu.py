@@ -24,6 +24,7 @@ from src.openings import identify as identify_opening
 from src.orientation import detect_orientation
 from src.overlay import (Annotation, BoardGeometry, OverlayManager,
                          build_annotations, visible_annotations)
+from src import themes
 from src.tracker import GameTracker
 from src.vision import VisionModel, certainty, dump_calibration, dump_recognition
 from src.vision_worker import VisionWorker
@@ -150,6 +151,7 @@ class MenuWindow(QtWidgets.QWidget):
         self._refresh_orientation_indicator()
         self._refresh_board_status()
         self._refresh_vision_status()
+        self._refresh_theme_combo()
         self._apply_engine_profile()
         self._sync_maia_controls()
         self._init_controller()
@@ -191,6 +193,12 @@ class MenuWindow(QtWidgets.QWidget):
         self.auto_calibrate_btn = QtWidgets.QPushButton("Calibrate board — auto-align (rough box)…")
         bf.addRow(self.calibrate_btn)
         bf.addRow(self.auto_calibrate_btn)
+        self.reposition_btn = QtWidgets.QPushButton("Reposition board only (keep pieces)…")
+        self.reposition_btn.setToolTip(
+            "Re-drag the board box WITHOUT relearning the pieces — for when the board "
+            "moved or changed size on screen. Templates are size-independent, so this "
+            "just re-aims the capture. Recalibrate vision only when the THEME changes.")
+        bf.addRow(self.reposition_btn)
         self.board_status = QtWidgets.QLabel()
         self.board_status.setWordWrap(True)
         bf.addRow(self.board_status)
@@ -230,6 +238,18 @@ class MenuWindow(QtWidgets.QWidget):
         row.addWidget(self.calib_vision_btn)
         row.addWidget(self.recognize_btn)
         vv.addLayout(row)
+        trow = QtWidgets.QHBoxLayout()
+        trow.addWidget(QtWidgets.QLabel("Theme:"))
+        self.theme_combo = QtWidgets.QComboBox()
+        self.theme_combo.setToolTip(
+            "Saved piece sets. Selecting one loads it instantly (no recalibration); "
+            "themes work at any board size.")
+        self.theme_save_btn = QtWidgets.QPushButton("Save current…")
+        self.theme_delete_btn = QtWidgets.QPushButton("Delete")
+        trow.addWidget(self.theme_combo, 1)
+        trow.addWidget(self.theme_save_btn)
+        trow.addWidget(self.theme_delete_btn)
+        vv.addLayout(trow)
         self.allow_illegal_cb = QtWidgets.QCheckBox(
             "Allow illegal moves (accept any read, skip legality check)")
         self.allow_illegal_cb.setChecked(self.cfg.allow_illegal)
@@ -517,6 +537,10 @@ class MenuWindow(QtWidgets.QWidget):
     def _connect_signals(self) -> None:
         self.calibrate_btn.clicked.connect(self._on_calibrate)
         self.auto_calibrate_btn.clicked.connect(self._on_auto_calibrate)
+        self.reposition_btn.clicked.connect(self._on_recalibrate_position)
+        self.theme_combo.currentIndexChanged.connect(self._on_theme_selected)
+        self.theme_save_btn.clicked.connect(self._on_save_theme)
+        self.theme_delete_btn.clicked.connect(self._on_delete_theme)
         self.analyze_btn.clicked.connect(self._on_analyze)
         self.stop_btn.clicked.connect(self._on_stop)
         self.snapshot_btn.clicked.connect(self._on_snapshot)
@@ -1014,8 +1038,86 @@ class MenuWindow(QtWidgets.QWidget):
         if not self.cfg.show_border:                 # reveal what it found so you can verify
             self.show_border_cb.setChecked(True)
 
-    def _apply_calibration(self, result, how: str) -> None:
-        """Adopt a calibration result (manual or auto) — identical downstream state."""
+    def _on_recalibrate_position(self) -> None:
+        """Re-aim the capture box WITHOUT relearning the pieces (board moved/resized)."""
+        if not self.vision.calibrated:
+            self.status_label.setText(
+                "Calibrate vision once first — then you can reposition without redoing it.")
+            return
+        self.hide()
+        QtWidgets.QApplication.processEvents()
+        result = calibrate(self._app, self._monitor_index(), self.cfg.white_bottom)
+        self.show()
+        self.raise_()
+        if result is None:
+            self.status_label.setText("Reposition cancelled.")
+            return
+        self._apply_calibration(result, "manual", keep_vision=True)
+
+    # ----- piece themes -----
+    def _refresh_theme_combo(self, select: str | None = None) -> None:
+        self.theme_combo.blockSignals(True)
+        self.theme_combo.clear()
+        self.theme_combo.addItem("— current (unsaved) —", "")
+        for name in themes.list_themes():
+            self.theme_combo.addItem(name, name)
+        if select:
+            i = self.theme_combo.findData(select)
+            if i >= 0:
+                self.theme_combo.setCurrentIndex(i)
+        self.theme_combo.blockSignals(False)
+        self.theme_delete_btn.setEnabled(bool(self.theme_combo.currentData()))
+
+    def _on_theme_selected(self, *_) -> None:
+        if self._loading:
+            return
+        name = self.theme_combo.currentData()
+        self.theme_delete_btn.setEnabled(bool(name))
+        if not name:                         # the "current (unsaved)" entry — do nothing
+            return
+        try:
+            model = themes.load_theme(name)
+        except Exception as exc:
+            self.status_label.setText(f"Couldn't load theme '{name}': {exc}")
+            return
+        self._stop_tracking()
+        self.vision = model
+        self._reset_tracking_state()
+        self._refresh_vision_status()
+        if self._cap_region is not None and self.cfg.auto_track:
+            self._set_track_checkbox(True)
+            self._start_tracking()
+        self.status_label.setText(
+            f"Loaded theme '{name}'." + ("" if self._cap_region else " Calibrate the board to use it."))
+
+    def _on_save_theme(self) -> None:
+        if not self.vision.calibrated:
+            self.status_label.setText("Calibrate vision first, then save it as a theme.")
+            return
+        name, ok = QtWidgets.QInputDialog.getText(self, "Save piece theme", "Theme name:")
+        if not ok or not name.strip():
+            return
+        try:
+            saved = themes.save_theme(name, self.vision)
+        except Exception as exc:
+            self.status_label.setText(f"Couldn't save theme: {exc}")
+            return
+        self._refresh_theme_combo(select=saved)
+        self.status_label.setText(f"Saved piece theme '{saved}'.")
+
+    def _on_delete_theme(self) -> None:
+        name = self.theme_combo.currentData()
+        if not name:
+            return
+        themes.delete_theme(name)
+        self._refresh_theme_combo()
+        self.status_label.setText(f"Deleted theme '{name}'.")
+
+    def _apply_calibration(self, result, how: str, keep_vision: bool = False) -> None:
+        """Adopt a calibration result. ``keep_vision`` repositions the capture box but
+        KEEPS the learned pieces (templates are size-normalised, so a different board
+        size still matches) — for when the board just moved/resized; otherwise it's a
+        clean slate (a possibly-different board/theme) and the pieces are dropped."""
         self.cfg.board_monitor = result.screen_index
         self.cfg.save()
         self._geometry = result.geometry
@@ -1024,8 +1126,18 @@ class MenuWindow(QtWidgets.QWidget):
         self._orient_belief = (None, 0.5)
         self._refresh_orientation_indicator()
         self._refresh_board_status()
-        # A (re)calibration is a clean slate: this may be a different board, so
-        # drop the old piece templates, tracking state, and arrows.
+        if keep_vision and self.vision.calibrated:
+            # Reposition only: same pieces, new box. Re-read at the new region; tracking
+            # resyncs to the live position.
+            self._reset_tracking_state()
+            if self.cfg.auto_track:
+                self._set_track_checkbox(True)
+                self._start_tracking()
+            self._on_snapshot()
+            self.status_label.setText(
+                f"Board repositioned ({how}, {result.phys_side}px) — pieces kept.")
+            return
+        # Full (re)calibration is a clean slate: drop the old templates, tracking, arrows.
         self._stop_tracking()
         self._set_track_checkbox(False)
         self.vision = VisionModel()

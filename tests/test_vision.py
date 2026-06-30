@@ -219,6 +219,50 @@ def test_robust_to_misalignment():
           f"worst {worst}")
 
 
+def test_themes_save_load_and_scale_invariance():
+    import os
+    import tempfile
+    import src.themes as T
+    from src.vision import VisionModel
+    m = _calibrated()
+    # --- raw VisionModel round-trip ---
+    path = Path(tempfile.gettempdir()) / "cw_theme_roundtrip.npz"
+    m.save(path)
+    try:
+        m2 = VisionModel.load(path)
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    check("theme: all 12 sprites restored", set(m2.sprites) == set(m.sprites), f"{sorted(m2.sprites)}")
+    check("theme: occ_thresh + orientation restored",
+          abs(m2.occ_thresh - m.occ_thresh) < 1e-6 and m2.white_bottom == m.white_bottom)
+    pos = _game("e4", "e5", "Nf3", "Nc6", "Bb5", "a6")
+    check("theme: loaded model recognises identically to the original",
+          m2.recognize(compose(pos)).board_fen() == m.recognize(compose(pos)).board_fen())
+    # the whole point: a DIFFERENT board pixel size still matches (cells are normalised)
+    big = cv2.resize(compose(pos), None, fx=1.6, fy=1.6, interpolation=cv2.INTER_CUBIC)
+    small = cv2.resize(compose(pos), None, fx=0.7, fy=0.7, interpolation=cv2.INTER_AREA)
+    check("theme: works at a LARGER board size (scale-invariant)",
+          not wrong(m2.recognize(big), pos), f"wrong={wrong(m2.recognize(big), pos)[:6]}")
+    check("theme: works at a SMALLER board size (scale-invariant)",
+          not wrong(m2.recognize(small), pos), f"wrong={wrong(m2.recognize(small), pos)[:6]}")
+    # --- themes manager (save/list/load/delete + name sanitization), in a temp dir ---
+    orig = T.THEMES_DIR
+    T.THEMES_DIR = Path(tempfile.gettempdir()) / "cw_themes_test_dir"
+    try:
+        name = T.save_theme("My Wood Set! 2024", m)
+        check("themes: name sanitized", name == "My Wood Set 2024", name)
+        check("themes: appears in the list", name in T.list_themes())
+        loaded = T.load_theme(name)
+        check("themes: load via manager restores sprites", set(loaded.sprites) == set(m.sprites))
+        T.delete_theme(name)
+        check("themes: delete removes it", name not in T.list_themes())
+    finally:
+        T.THEMES_DIR = orig
+
+
 def test_empty_board_reads_empty():
     m = _calibrated()
     got = m.recognize(compose({}))
@@ -259,6 +303,7 @@ if __name__ == "__main__":
                test_last_move_highlight, test_both_orientations,
                test_orientation_autodetected_from_pixels, test_stale_setting_does_not_rotate,
                test_exhaustive_random_real_pixels, test_robust_to_misalignment,
+               test_themes_save_load_and_scale_invariance,
                test_empty_board_reads_empty,
                test_uncalibrated_raises, test_degenerate_images_no_crash, test_certainty_signal):
         print(fn.__name__)
