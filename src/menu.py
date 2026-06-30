@@ -142,7 +142,8 @@ class MenuWindow(QtWidgets.QWidget):
         self._vision_worker: VisionWorker | None = None
 
         self.setWindowTitle("Chess Overlay")
-        self.setMinimumWidth(420)
+        self.setMinimumWidth(600)
+        self.resize(640, 720)
         self._build_ui()
 
         self.overlay.show()
@@ -295,7 +296,6 @@ class MenuWindow(QtWidgets.QWidget):
         self.engine_status = QtWidgets.QLabel("Engine: starting…")
         self.engine_status.setWordWrap(True)
         slf.addRow(self.engine_status)
-        v.addWidget(sel)
 
         # --- search resources (Stockfish / Leela) ---
         self.search_group = QtWidgets.QGroupBox("Search")
@@ -313,7 +313,7 @@ class MenuWindow(QtWidgets.QWidget):
         ef.addRow("Opp refine ceiling", self.opp_max_spin)
         ef.addRow("Threads", self.threads_spin)
         ef.addRow("Hash (MB)", self.hash_spin)
-        v.addWidget(self.search_group)
+        v.addLayout(self._row(sel, self.search_group))
 
         # --- Stockfish strength limiter (simulated Elo) ---
         self.strength_group = QtWidgets.QGroupBox("Player eval strength")
@@ -416,11 +416,10 @@ class MenuWindow(QtWidgets.QWidget):
         mrow.addWidget(self.mode_live_radio)
         mrow.addWidget(self.mode_puzzle_radio)
         mrow.addStretch(1)
-        v.addWidget(mode)
 
-        # Player colour and board orientation are INDEPENDENT. Colour sets the
-        # green (mine) / red (opponent) split; orientation is purely how the board is
-        # read and drawn. Neither control touches the other.
+        # Player colour and board orientation are INDEPENDENT. Colour sets the green
+        # (mine) / red (opponent) split; orientation is purely how the board is read
+        # and drawn. Neither control touches the other.
         colour = QtWidgets.QGroupBox("Player colour && board")
         cf = QtWidgets.QFormLayout(colour)
         self.player_colour_combo = QtWidgets.QComboBox()
@@ -436,52 +435,38 @@ class MenuWindow(QtWidgets.QWidget):
         self.orientation_label = QtWidgets.QLabel()
         self.orientation_label.setWordWrap(True)
         cf.addRow(self.orientation_label)
-        self.flip_orient_btn = QtWidgets.QPushButton("Flip board orientation (if vision read it upside down)")
+        self.flip_orient_btn = QtWidgets.QPushButton("Flip board orientation")
         self.flip_orient_btn.setToolTip(
             "Rotates how the board is read and drawn 180° — use if the arrows/pieces look "
             "upside down. Does NOT change who you're playing as. Recalibrating vision is "
             "the cleaner fix.")
         cf.addRow(self.flip_orient_btn)
-        v.addWidget(colour)
 
         # Whose turn — the weakest signal, so make it explicit and overridable.
         turn = QtWidgets.QGroupBox("Whose turn")
         tf = QtWidgets.QVBoxLayout(turn)
         self.turn_label = QtWidgets.QLabel("To move: —")
         tf.addWidget(self.turn_label)
-        trow = QtWidgets.QHBoxLayout()
+        tgrid = QtWidgets.QGridLayout()
         self.turn_white_btn = QtWidgets.QPushButton("White to move")
         self.turn_black_btn = QtWidgets.QPushButton("Black to move")
         self.turn_mine_btn = QtWidgets.QPushButton("My move")
         self.turn_opp_btn = QtWidgets.QPushButton("Opponent's move")
-        for b in (self.turn_white_btn, self.turn_black_btn, self.turn_mine_btn, self.turn_opp_btn):
-            trow.addWidget(b)
-        tf.addLayout(trow)
+        tgrid.addWidget(self.turn_white_btn, 0, 0)
+        tgrid.addWidget(self.turn_black_btn, 0, 1)
+        tgrid.addWidget(self.turn_mine_btn, 1, 0)
+        tgrid.addWidget(self.turn_opp_btn, 1, 1)
+        tf.addLayout(tgrid)
         turn_note = QtWidgets.QLabel(
-            "Live: correct whose turn it is if the tracker drifts ('My/Opponent's move' "
-            "are relative to your colour). Puzzle: these force which side to solve for, "
-            "overriding the auto-picked side.")
+            "Live: fix whose turn it is if the tracker drifts. Puzzle: force which side "
+            "to solve for (overrides the auto-pick).")
         turn_note.setWordWrap(True)
         tf.addWidget(turn_note)
-        v.addWidget(turn)
-
-        opts = QtWidgets.QVBoxLayout()
-        self.track_cb = QtWidgets.QCheckBox("Auto-track game (live board → engine)")
-        self.track_cb.setChecked(self.cfg.auto_track)
-        opts.addWidget(self.track_cb)
-        self.predict_cb = QtWidgets.QCheckBox("Show opponent's likely moves (red) on their turn")
-        self.predict_cb.setChecked(self.cfg.show_predicted)
-        opts.addWidget(self.predict_cb)
-        self.pause_drag_cb = QtWidgets.QCheckBox("Pause eval while dragging a piece")
-        self.pause_drag_cb.setChecked(self.cfg.pause_on_drag)
-        opts.addWidget(self.pause_drag_cb)
-        v.addLayout(opts)
 
         # Puzzle options — only meaningful in Puzzle mode (disabled in Live play).
         self.puzzle_group = QtWidgets.QGroupBox("Puzzle options")
         pf = QtWidgets.QVBoxLayout(self.puzzle_group)
-        self.puzzle_winning_cb = QtWidgets.QCheckBox(
-            "Show only the winning side's move (hide the other side's)")
+        self.puzzle_winning_cb = QtWidgets.QCheckBox("Show only the winning side's move")
         self.puzzle_winning_cb.setChecked(self.cfg.puzzle_winning_only)
         pf.addWidget(self.puzzle_winning_cb)
         self.puzzle_auto_btn = QtWidgets.QPushButton("Auto-pick the side to solve")
@@ -490,11 +475,27 @@ class MenuWindow(QtWidgets.QWidget):
             "this (force White/Black to move); this clears that override.")
         pf.addWidget(self.puzzle_auto_btn)
         self.puzzle_note = QtWidgets.QLabel(
-            "Analyses the position as both sides and shows the decisive side's single "
-            "best move. Eval engines only (Stockfish / Leela).")
+            "Shows the decisive side's single best move (both sides analysed). Eval "
+            "engines only.")
         self.puzzle_note.setWordWrap(True)
         pf.addWidget(self.puzzle_note)
-        v.addWidget(self.puzzle_group)
+
+        # Live-play options.
+        live = QtWidgets.QGroupBox("Live play options")
+        lo = QtWidgets.QVBoxLayout(live)
+        self.track_cb = QtWidgets.QCheckBox("Auto-track game (live board → engine)")
+        self.track_cb.setChecked(self.cfg.auto_track)
+        self.predict_cb = QtWidgets.QCheckBox("Show opponent's likely moves (red) on their turn")
+        self.predict_cb.setChecked(self.cfg.show_predicted)
+        self.pause_drag_cb = QtWidgets.QCheckBox("Pause eval while dragging a piece")
+        self.pause_drag_cb.setChecked(self.cfg.pause_on_drag)
+        for cb in (self.track_cb, self.predict_cb, self.pause_drag_cb):
+            lo.addWidget(cb)
+
+        # Two columns so the panel isn't so tall.
+        v.addLayout(self._row(mode, colour))
+        v.addLayout(self._row(turn, self.puzzle_group))
+        v.addWidget(live)
 
         self.fen_edit = QtWidgets.QLineEdit(chess.STARTING_FEN)
         v.addWidget(self.fen_edit)
@@ -525,6 +526,15 @@ class MenuWindow(QtWidgets.QWidget):
         self.moves_view.setFixedHeight(64)
         v.addWidget(self.moves_view)
         return w
+
+    @staticmethod
+    def _row(*widgets) -> QtWidgets.QHBoxLayout:
+        """Lay widgets out side by side (equal width, top-aligned) — trade width for
+        height so the panel stays short."""
+        h = QtWidgets.QHBoxLayout()
+        for wdg in widgets:
+            h.addWidget(wdg, 1, QtCore.Qt.AlignTop)
+        return h
 
     @staticmethod
     def _spin(lo, hi, val, step=1) -> QtWidgets.QSpinBox:
