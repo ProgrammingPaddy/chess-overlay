@@ -138,6 +138,7 @@ class MenuWindow(QtWidgets.QWidget):
         self._puzzle_side: bool | None = None        # puzzle: forced side to solve (None = auto)
         self._orient_belief: tuple = (None, 0.5)     # (CV agrees with active orientation? , confidence)
         self._orient_votes = 0                       # consecutive confident-disagree frames
+        self._orient_locked_key: str | None = None   # placement we last re-oriented on (no ping-pong)
 
         self._vision_worker: VisionWorker | None = None
 
@@ -818,7 +819,9 @@ class MenuWindow(QtWidgets.QWidget):
         self._reanalyze_current()
 
     def _on_flip_orientation(self) -> None:
-        """Manual fallback when vision read the orientation upside down."""
+        """Manual fallback when vision read the orientation upside down. Locks this
+        placement so auto-orient won't immediately undo your choice."""
+        self._orient_locked_key = self._orient_ref_key()
         self._apply_orientation(not self.cfg.white_bottom)
         self.status_label.setText(
             f"Board orientation flipped — {'White' if self.cfg.white_bottom else 'Black'} on bottom.")
@@ -1271,6 +1274,7 @@ class MenuWindow(QtWidgets.QWidget):
         self._believed = None
         self._consensus.clear()
         self._puzzle_side = None        # a fresh position re-auto-picks the puzzle side
+        self._orient_locked_key = None  # ...and re-enables one auto-orient on it
 
     def _update_certainty(self, conf: float) -> None:
         self.certainty_bar.setValue(int(round(conf * 100)))
@@ -1460,25 +1464,48 @@ class MenuWindow(QtWidgets.QWidget):
         agree, conf = self._orient_belief
         self.overlay.set_orientation(show, agree, conf)
 
+    @staticmethod
+    def _mirror(board: chess.Board) -> chess.Board:
+        """180° rotation (colours preserved) — the same pieces in the other orientation."""
+        return board.transform(chess.flip_vertical).transform(chess.flip_horizontal)
+
+    def _orient_ref_key(self) -> str | None:
+        """A FLIP-INVARIANT identity of the believed placement: the pieces mapped into a
+        fixed (white_bottom=True) frame. It doesn't change when we flip the orientation,
+        so it identifies 'this position' across a flip (a new puzzle/board changes it)."""
+        b = self._believed
+        if b is None:
+            return None
+        ref = b if self.cfg.white_bottom else self._mirror(b)
+        return ref.board_fen()
+
     def _update_orientation_belief(self) -> None:
-        """Run the chess-reasoning orientation detector on the believed board to (a)
-        drive the overlay indicator and (b) auto-correct the orientation when the CV
-        is confident and sustained that the board is upside down."""
+        """Drive the overlay indicator and (with auto_orient) correct the orientation.
+
+        The detector runs on a FIXED-frame reference (the believed pieces always mapped
+        as if white_bottom=True), so its verdict does NOT change when we flip — auto-
+        orient converges in ONE step instead of oscillating (flipping the board used to
+        change the detector's own input, which let it ping-pong, mirroring the CV
+        preview and the analysis). A per-position lock additionally guarantees at most
+        one auto-flip per placement (so it can't ping-pong and won't fight a manual
+        flip); a new puzzle/board has a different reference and re-enables it."""
         board = self._believed
         if (board is None or board.king(chess.WHITE) is None
                 or board.king(chess.BLACK) is None):
             return
-        # detect_orientation asks "is White on the LOW ranks of THIS board?". The
-        # believed board is mapped with the active white_bottom, so True => the active
-        # orientation is self-consistent (the CV agrees); p = P(white on bottom).
-        bel_wb, p = detect_orientation(board)
-        agree = bool(bel_wb)
-        self._orient_belief = (agree, p if agree else 1.0 - p)
-        if self.cfg.auto_orient and not agree and p < ORIENT_FLIP_P:
+        ref = board if self.cfg.white_bottom else self._mirror(board)
+        ref_key = ref.board_fen()
+        correct_wb, p = detect_orientation(ref)       # the value white_bottom SHOULD have
+        agree = (self.cfg.white_bottom == correct_wb)
+        conf = p if correct_wb else (1.0 - p)          # confidence that correct_wb is right
+        self._orient_belief = (agree, conf)
+        if (self.cfg.auto_orient and not agree and conf >= (1.0 - ORIENT_FLIP_P)
+                and ref_key != self._orient_locked_key):
             self._orient_votes += 1
             if self._orient_votes >= ORIENT_FLIP_FRAMES:
                 self._orient_votes = 0
-                self._apply_orientation(not self.cfg.white_bottom)   # resets the belief
+                self._orient_locked_key = ref_key      # at most one auto-flip per placement
+                self._apply_orientation(correct_wb)    # idempotent: ref is unchanged after
                 self.status_label.setText(
                     f"Auto-corrected orientation — "
                     f"{'White' if self.cfg.white_bottom else 'Black'} on bottom (CV).")
