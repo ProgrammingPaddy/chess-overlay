@@ -927,6 +927,22 @@ class MenuWindow(QtWidgets.QWidget):
             # In puzzle mode the greens are the (engine-determined) side-to-move's best
             # and the reds are the other side; 'winning side only' hides the reds.
             show_opp = (not self.cfg.puzzle_winning_only) if puzzle else self.cfg.show_predicted
+            # Winning-side-only: the greens are the SIDE-TO-MOVE's best move. After you
+            # play the solution it becomes the OPPONENT's turn, so that "best move" is
+            # their forced reply — losing for them. That is not the winning side's move,
+            # so suppress it (you'll see your next move once the opponent has replied)
+            # instead of flashing the opponent's move as if it were the solution.
+            if puzzle and self.cfg.puzzle_winning_only and suggestions:
+                top = suggestions[0]
+                side_to_move_winning = (
+                    (top.mate_in is not None and top.mate_in > 0)            # they mate
+                    or (top.mate_in is None and top.score_cp is not None     # or are ahead
+                        and top.score_cp >= 0))
+                opponent_reply = not side_to_move_winning                    # losing -> their forced reply
+            else:
+                opponent_reply = False
+            if opponent_reply:
+                suggestions = []
             self.results_list.clear()
             flip = board.turn != chess.WHITE     # show eval ABSOLUTE (white +, black -)
             for s in suggestions:
@@ -940,7 +956,12 @@ class MenuWindow(QtWidgets.QWidget):
                                                   board.turn == chess.WHITE, self.cfg.gold_moves,
                                                   policy_mode=policy)
             self._draw_arrows()
-            if not suggestions:
+            if opponent_reply:
+                side = "White" if board.turn == chess.WHITE else "Black"
+                self.status_label.setText(
+                    f"Puzzle — {side} (opponent) to reply; waiting for your move "
+                    f"(winning side only).")
+            elif not suggestions:
                 self.status_label.setText(self._terminal_status(board, opp_suggestions))
             elif puzzle:
                 side = "White" if board.turn == chess.WHITE else "Black"
