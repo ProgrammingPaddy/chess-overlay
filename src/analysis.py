@@ -308,21 +308,42 @@ class EngineController(QtCore.QThread):
             return chess.WHITE
         return chess.WHITE if cls._standout(white_sugg) >= cls._standout(black_sugg) else chess.BLACK
 
+    def _analyse_blocking(self, board: chess.Board, multipv: int, depth: int) -> list:
+        """Ranked MoveSuggestions via a BLOCKING ``engine.analyse`` (runs to ``depth``
+        and returns). Unlike the streaming ``_top_moves``, python-chess consumes the
+        whole analysis internally and tears it down cleanly — there is no half-drained
+        streaming analysis left for its background parser thread to keep working on.
+        Puzzle mode uses this: its rapid both-sides + refine cycling, abruptly
+        interrupted as you flick through puzzles, corrupted python-chess's async parser
+        and segfaulted. Hands the engine a private board copy (see _top_moves)."""
+        n = max(1, min(multipv, board.legal_moves.count()))
+        try:
+            infos = self._engine.analyse(board.copy(), chess.engine.Limit(depth=depth),
+                                         multipv=n)
+        except Exception:
+            return []
+        if isinstance(infos, dict):                  # may collapse to a single InfoDict
+            infos = [infos]
+        out = []
+        for rank, info in enumerate(infos, start=1):
+            s = MoveSuggestion.from_info(info, board, rank)
+            if s:
+                out.append(s)
+        return out
+
     def _analyze_puzzle(self, board: chess.Board, multipv: int, depth: int, token: int,
                         forced_side: bool | None = None) -> None:
         """Puzzle mode: treat the position as isolated and work out whose move it is by
         analysing BOTH sides, then show the side-to-move's best move(s) as the greens
         and the other side's as the reds. The side to move is the one whose best move
         STANDS OUT most from its alternatives (it holds the puzzle's uniquely-good
-        tactic, see _standout); a side that is illegal to move (would leave the
-        opponent in check) or has no moves is discarded, which also resolves the turn
-        when one side is in check. ``forced_side`` (the user's 'whose turn'
-        override) pins the side instead, as long as that side has a legal move. Always
-        full strength.
+        tactic, see _standout); a side illegal to move (the opponent left in check) or
+        with no moves is discarded, which also resolves the turn when one side is in
+        check. ``forced_side`` pins the side if it has a legal move. Always full strength.
 
-        Like live analysis, it shows a move immediately: a fast low-depth pass on both
-        sides picks the decisive side and emits at once, then THAT side refines (streams
-        deeper, up to ``depth``) while the other side stays as the reds."""
+        Two BLOCKING stages (see _analyse_blocking — streaming here segfaulted): a fast
+        low-depth pass on both sides picks the side and shows a move at once, then that
+        side is re-analysed at full depth. Interruptible between stages."""
         self._strength_full()
         preview = max(2, min(self.PUZZLE_PREVIEW_DEPTH, depth))
         pick_mpv = max(2, multipv)     # need >=2 lines/side to measure the standout
@@ -333,23 +354,26 @@ class EngineController(QtCore.QThread):
             b = board.copy()
             b.turn = color
             b.clear_stack()
-            best[color] = self._top_moves(b, pick_mpv, preview) if (b.is_valid()
+            best[color] = self._analyse_blocking(b, pick_mpv, preview) if (b.is_valid()
                           and b.legal_moves.count() > 0) else []
         if not best[chess.WHITE] and not best[chess.BLACK]:
             self._emit_update([], 0, board, [], token)
             return
         win_color = self._puzzle_side_to_move(best[chess.WHITE], best[chess.BLACK], forced_side)
-        win_sugg = best[win_color][:multipv]          # show the configured number of moves
         lose_sugg = best[not win_color][:multipv]
         target = board.copy()
         target.turn = win_color
         target.clear_stack()
-        self._emit_update(win_sugg, preview, target, lose_sugg, token)   # instant
-        if self._wake.is_set() or self._shutdown:
+        self._emit_update(best[win_color][:multipv], preview, target, lose_sugg, token)  # instant
+        # Refine the chosen side a bit deeper (still blocking). Cap the depth: a blocking
+        # call isn't interruptible mid-search, so this bounds how long flicking to the
+        # next puzzle can stall (the preview already shows the move).
+        refine_depth = min(depth, 16)
+        if self._wake.is_set() or self._shutdown or refine_depth <= preview:
             return
-        # refine the decisive side up to the configured depth, keeping the reds.
-        self._stream_player(target, multipv, "fixed", depth, lose_sugg, token,
-                            min_emit_depth=preview)
+        refined = self._analyse_blocking(target, multipv, refine_depth)
+        if refined and not (self._wake.is_set() or self._shutdown):
+            self._emit_update(refined, refine_depth, target, lose_sugg, token)
 
     def _stream_player(self, target_board: chess.Board, multipv: int, mode: str,
                        depth: int, opp_suggestions: list, token: int,
