@@ -256,7 +256,7 @@ class EngineController(QtCore.QThread):
             self._analyze_puzzle(board, multipv, depth, token, puzzle_side)
             return
         if board.legal_moves.count() == 0:
-            self.updated.emit([], 0, board, [], token)
+            self._emit_update([], 0, board, [], token)
             return
 
         opponent_to_move = (player_color is not None and board.is_valid()
@@ -333,7 +333,7 @@ class EngineController(QtCore.QThread):
             best[color] = self._top_moves(b, pick_mpv, preview) if (b.is_valid()
                           and b.legal_moves.count() > 0) else []
         if not best[chess.WHITE] and not best[chess.BLACK]:
-            self.updated.emit([], 0, board, [], token)
+            self._emit_update([], 0, board, [], token)
             return
         win_color = self._puzzle_side_to_move(best[chess.WHITE], best[chess.BLACK], forced_side)
         win_sugg = best[win_color][:multipv]          # show the configured number of moves
@@ -341,7 +341,7 @@ class EngineController(QtCore.QThread):
         target = board.copy()
         target.turn = win_color
         target.clear_stack()
-        self.updated.emit(win_sugg, preview, target, lose_sugg, token)   # instant
+        self._emit_update(win_sugg, preview, target, lose_sugg, token)   # instant
         if self._wake.is_set() or self._shutdown:
             return
         # refine the decisive side up to the configured depth, keeping the reds.
@@ -356,7 +356,7 @@ class EngineController(QtCore.QThread):
         once the coherent depth exceeds ``min_emit_depth`` (so a deep stream layered
         after a refinement loop doesn't briefly regress to shallow lines)."""
         if target_board.legal_moves.count() == 0:
-            self.updated.emit([], 0, target_board, opp_suggestions, token)
+            self._emit_update([], 0, target_board, opp_suggestions, token)
             return
         n = min(multipv, target_board.legal_moves.count())
         limit = chess.engine.Limit(depth=depth) if mode == "fixed" else None
@@ -402,18 +402,18 @@ class EngineController(QtCore.QThread):
                 self._strength_full()                      # opponent prediction: full strength
                 opp = self._top_moves(board, multipv, d)
                 if not opp:
-                    self.updated.emit([], 0, board, [], token)
+                    self._emit_update([], 0, board, [], token)
                     return
                 target = board.copy()
                 target.push(opp[0].move)
                 if target.legal_moves.count() == 0:        # opponent's best ends the game
-                    self.updated.emit([], 0, target, opp, token)
+                    self._emit_update([], 0, target, opp, token)
                     return
                 if self._wake.is_set() or self._shutdown:
                     return
                 self._strength_player()                    # player's responses: limited
                 responses = self._top_moves(target, multipv, d)
-                self.updated.emit(responses, d, target, opp, token)
+                self._emit_update(responses, d, target, opp, token)
             # Candidates settled at the ceiling; now refine the responses deeply on
             # that line (only emitting past the ceiling, so they don't regress).
             if not (self._wake.is_set() or self._shutdown) and opp:
@@ -446,7 +446,7 @@ class EngineController(QtCore.QThread):
             self._strength_full()                                    # opponent candidates: full strength
             fixed_opp = self._top_moves(board, multipv, opp_depth)   # fast preview, then deepen replies
             if not fixed_opp:
-                self.updated.emit([], 0, board, [], token)
+                self._emit_update([], 0, board, [], token)
                 return
         for d in self._deepen_schedule(opp_depth, opp_max):
             if self._wake.is_set() or self._shutdown:
@@ -457,7 +457,7 @@ class EngineController(QtCore.QThread):
                 self._strength_full()                                # opponent candidates: full strength
                 opp = self._top_moves(board, multipv, d)
             if not opp:
-                self.updated.emit([], 0, board, [], token)
+                self._emit_update([], 0, board, [], token)
                 return
             self._strength_player()                                  # player's replies: limited
             responses = self._predictive_replies(board, opp, d)
@@ -465,7 +465,7 @@ class EngineController(QtCore.QThread):
                 return
             target = board.copy()
             target.push(opp[0].move)              # turn == player: correct eval POV downstream
-            self.updated.emit(responses, d, target, opp, token)
+            self._emit_update(responses, d, target, opp, token)
 
     def _predictive_replies(self, board: chess.Board, opp_suggestions: list,
                             depth: int) -> list | None:
@@ -486,6 +486,16 @@ class EngineController(QtCore.QThread):
                 responses.append(best[0])
         return responses
 
+    def _emit_update(self, suggestions, depth, board, opp_suggestions, token) -> None:
+        """Emit to the GUI thread with a COPY of the board (position only). The worker
+        keeps using ITS board right after this returns — handing it to the engine and
+        pushing moves — while the GUI calls board.san()/push() on what it receives;
+        sharing one chess.Board across the two threads lets their push/pop race and
+        corrupt its internal stack, which segfaults. The GUI needs the placement and
+        side to move, not the history, so stack=False keeps the copy cheap."""
+        safe = board.copy(stack=False) if board is not None else board
+        self.updated.emit(suggestions, depth, safe, opp_suggestions, token)
+
     def _emit(self, latest, depth, board, opp_suggestions, token) -> None:
         out = []
         for rank, key in enumerate(sorted(latest), start=1):
@@ -493,4 +503,4 @@ class EngineController(QtCore.QThread):
             if s:
                 out.append(s)
         if out:
-            self.updated.emit(out, depth, board, opp_suggestions, token)
+            self._emit_update(out, depth, board, opp_suggestions, token)

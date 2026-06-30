@@ -7,6 +7,7 @@ engine settings, and position analysis all live there. Run:
 """
 from __future__ import annotations
 
+import faulthandler
 import sys
 import threading
 import time
@@ -16,6 +17,7 @@ from pathlib import Path
 from PySide6 import QtWidgets
 
 CRASH_LOG = Path(__file__).resolve().parent / "debug" / "crash.log"
+_fault_fh = None        # kept alive for the process lifetime so faulthandler can write
 
 
 def _write_crash(where: str, exc_type, exc, tb) -> None:
@@ -42,6 +44,20 @@ def _install_crash_logging() -> None:
         _write_crash(f"thread:{args.thread.name}", args.exc_type,
                      args.exc_value, args.exc_traceback)
     threading.excepthook = thread_hook
+
+    # A segfault (C-level — a native lib or a cross-thread data race) bypasses
+    # sys.excepthook entirely; faulthandler dumps a Python+C traceback for ALL threads
+    # to this file so such a crash isn't silent.
+    global _fault_fh
+    try:
+        CRASH_LOG.parent.mkdir(exist_ok=True)
+        _fault_fh = open(CRASH_LOG.parent / "faulthandler.log", "a", encoding="utf-8")
+        faulthandler.enable(file=_fault_fh, all_threads=True)
+    except Exception:
+        try:
+            faulthandler.enable(all_threads=True)   # fall back to stderr
+        except Exception:
+            pass
 
 
 def _enable_dpi_awareness() -> None:

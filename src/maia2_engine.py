@@ -185,9 +185,15 @@ class Maia2Controller(QtCore.QThread):
     def _superseded(self) -> bool:
         return self._wake.is_set() or self._shutdown
 
+    def _emit_update(self, suggestions, depth, board, opp_suggestions, token) -> None:
+        """Emit with a COPY of the board (position only) so the worker and the GUI
+        never push/pop the same chess.Board concurrently (that races and segfaults)."""
+        safe = board.copy(stack=False) if board is not None else board
+        self.updated.emit(suggestions, depth, safe, opp_suggestions, token)
+
     def _analyze(self, board, multipv, mode, player_color, token, player_elo, opp_elo) -> None:
         if board.legal_moves.count() == 0:
-            self.updated.emit([], 0, board, [], token)
+            self._emit_update([], 0, board, [], token)
             return
 
         opponent_to_move = (player_color is not None and board.is_valid()
@@ -195,7 +201,7 @@ class Maia2Controller(QtCore.QThread):
         if not opponent_to_move:
             res = self._query([{"fen": board.fen(), "elo_self": player_elo,
                                 "elo_oppo": opp_elo}], multipv)
-            self.updated.emit(self._suggestions(res[0], board) if res else [], 0, board, [], token)
+            self._emit_update(self._suggestions(res[0], board) if res else [], 0, board, [], token)
             return
 
         # Opponent to move: their likely moves (reds) at the OPPONENT's Elo.
@@ -203,7 +209,7 @@ class Maia2Controller(QtCore.QThread):
                             "elo_oppo": player_elo}], multipv)
         opp_sugg = self._suggestions(res[0], board) if res else []
         if not opp_sugg:
-            self.updated.emit([], 0, board, [], token)
+            self._emit_update([], 0, board, [], token)
             return
         if self._superseded():
             return
@@ -228,14 +234,14 @@ class Maia2Controller(QtCore.QThread):
                     greens.append(top[0])        # the single best human reply, paired to its opp move
             target = board.copy()
             target.push(opp_sugg[0].move)
-            self.updated.emit(greens, 0, target, opp_sugg, token)
+            self._emit_update(greens, 0, target, opp_sugg, token)
         else:
             target = board.copy()
             target.push(opp_sugg[0].move)
             if target.legal_moves.count() == 0:
-                self.updated.emit([], 0, target, opp_sugg, token)
+                self._emit_update([], 0, target, opp_sugg, token)
                 return
             res2 = self._query([{"fen": target.fen(), "elo_self": player_elo,
                                  "elo_oppo": opp_elo}], multipv)
             greens = self._suggestions(res2[0], target) if res2 else []
-            self.updated.emit(greens, 0, target, opp_sugg, token)
+            self._emit_update(greens, 0, target, opp_sugg, token)
