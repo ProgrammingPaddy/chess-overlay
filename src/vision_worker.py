@@ -30,6 +30,7 @@ class VisionWorker(QtCore.QThread):
     def run(self) -> None:
         capture = ScreenCapture()
         last_img = last_board = last_debug = None
+        last_orient = None
         try:
             while not self._stop:
                 region = self._region_fn()
@@ -39,17 +40,22 @@ class VisionWorker(QtCore.QThread):
                     continue
                 try:
                     img = capture.grab(*region)
+                    orient = self._orient_fn()
                     # Skip the (expensive) per-square recognition when the captured
                     # board is byte-identical to the last frame — the result is
                     # provably the same, so reuse it. array_equal short-circuits on
                     # the first differing pixel, so a real move costs ~nothing; this
-                    # just avoids re-recognising a still board ~20x/second.
+                    # just avoids re-recognising a still board ~20x/second. The reuse
+                    # MUST also require the orientation to be unchanged: the recognised
+                    # squares depend on it, so a flip on a STATIC board (a puzzle) must
+                    # re-map — otherwise the believed board lags the setting and the
+                    # auto-orient logic oscillates.
                     if (last_img is not None and img.shape == last_img.shape
-                            and np.array_equal(img, last_img)):
+                            and orient == last_orient and np.array_equal(img, last_img)):
                         board, debug = last_board, last_debug
                     else:
-                        board, debug = self._vision.analyze(img, self._orient_fn())
-                        last_img, last_board, last_debug = img, board, debug
+                        board, debug = self._vision.analyze(img, orient)
+                        last_img, last_board, last_debug, last_orient = img, board, debug, orient
                     self.frame.emit(board, debug)
                 except Exception:
                     pass

@@ -821,7 +821,7 @@ class MenuWindow(QtWidgets.QWidget):
     def _on_flip_orientation(self) -> None:
         """Manual fallback when vision read the orientation upside down. Locks this
         placement so auto-orient won't immediately undo your choice."""
-        self._orient_locked_key = self._orient_ref_key()
+        self._orient_locked_key = self._orient_canonical_key()
         self._apply_orientation(not self.cfg.white_bottom)
         self.status_label.setText(
             f"Board orientation flipped — {'White' if self.cfg.white_bottom else 'Black'} on bottom.")
@@ -1469,15 +1469,18 @@ class MenuWindow(QtWidgets.QWidget):
         """180° rotation (colours preserved) — the same pieces in the other orientation."""
         return board.transform(chess.flip_vertical).transform(chess.flip_horizontal)
 
-    def _orient_ref_key(self) -> str | None:
-        """A FLIP-INVARIANT identity of the believed placement: the pieces mapped into a
-        fixed (white_bottom=True) frame. It doesn't change when we flip the orientation,
-        so it identifies 'this position' across a flip (a new puzzle/board changes it)."""
-        b = self._believed
+    def _orient_canonical_key(self, board: chess.Board | None = None) -> str | None:
+        """A FLIP-INVARIANT identity of the placement: ``min(fen, mirror_fen)`` is
+        identical for a board AND its 180° mirror, so flipping the orientation never
+        changes it (only a genuinely different puzzle/board does). This is what locks
+        auto-orient to one flip per position — even if the believed board momentarily
+        lags the setting, the key is the same, so the lock still holds and it can't
+        ping-pong. (A plain fen would alternate P/mirror(P) across a flip and defeat
+        the lock — that was the residual oscillation.)"""
+        b = self._believed if board is None else board
         if b is None:
             return None
-        ref = b if self.cfg.white_bottom else self._mirror(b)
-        return ref.board_fen()
+        return min(b.board_fen(), self._mirror(b).board_fen())
 
     def _update_orientation_belief(self) -> None:
         """Drive the overlay indicator and (with auto_orient) correct the orientation.
@@ -1494,17 +1497,17 @@ class MenuWindow(QtWidgets.QWidget):
                 or board.king(chess.BLACK) is None):
             return
         ref = board if self.cfg.white_bottom else self._mirror(board)
-        ref_key = ref.board_fen()
+        lock_key = self._orient_canonical_key(board)
         correct_wb, p = detect_orientation(ref)       # the value white_bottom SHOULD have
         agree = (self.cfg.white_bottom == correct_wb)
         conf = p if correct_wb else (1.0 - p)          # confidence that correct_wb is right
         self._orient_belief = (agree, conf)
         if (self.cfg.auto_orient and not agree and conf >= (1.0 - ORIENT_FLIP_P)
-                and ref_key != self._orient_locked_key):
+                and lock_key != self._orient_locked_key):
             self._orient_votes += 1
             if self._orient_votes >= ORIENT_FLIP_FRAMES:
                 self._orient_votes = 0
-                self._orient_locked_key = ref_key      # at most one auto-flip per placement
+                self._orient_locked_key = lock_key     # at most one auto-flip per placement
                 self._apply_orientation(correct_wb)    # idempotent: ref is unchanged after
                 self.status_label.setText(
                     f"Auto-corrected orientation — "
