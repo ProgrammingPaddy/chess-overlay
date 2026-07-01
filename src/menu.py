@@ -23,7 +23,7 @@ from src.engine import find_stockfish
 from src.openings import identify as identify_opening
 from src.orientation import detect_orientation
 from src.overlay import (Annotation, BoardGeometry, OverlayManager,
-                         build_annotations, visible_annotations)
+                         build_annotations, build_puzzle_line, visible_annotations)
 from src import themes
 from src.tracker import GameTracker
 from src.vision import VisionModel, certainty, dump_calibration, dump_recognition
@@ -135,7 +135,12 @@ class MenuWindow(QtWidgets.QWidget):
         self._suggestions: list[Annotation] = []    # latest engine arrows (pre-filter)
         self._believed: chess.Board | None = None    # what the CV currently sees
         self._consensus = ConsensusBuffer(CONSENSUS_WINDOW)
-        self._puzzle_side: bool | None = None        # puzzle: forced side to solve (None = auto)
+        self._puzzle_side: bool | None = None        # puzzle: side to solve for now (None = pick it)
+        self._puzzle_side_forced = False             # did YOU pin the side (vs auto/parity)?
+        self._puzzle_side_source = "auto"            # where the side came from (status text)
+        self._puzzle_anchor: str | None = None       # placement the current puzzle side applies to
+        self._last_highlight = None                  # latest move-highlight read (VisionWorker)
+        self._filter_arrows = True                   # hide arrows off the live board (off for solution lines)
         self._orient_belief: tuple = (None, 0.5)     # (CV agrees with active orientation? , confidence)
         self._orient_votes = 0                       # consecutive confident-disagree frames
         self._orient_locked_key: str | None = None   # placement we last re-oriented on (no ping-pong)
@@ -467,17 +472,35 @@ class MenuWindow(QtWidgets.QWidget):
         # Puzzle options — only meaningful in Puzzle mode (disabled in Live play).
         self.puzzle_group = QtWidgets.QGroupBox("Puzzle options")
         pf = QtWidgets.QVBoxLayout(self.puzzle_group)
-        self.puzzle_winning_cb = QtWidgets.QCheckBox("Show only the winning side's move")
+        arow = QtWidgets.QHBoxLayout()
+        arow.addWidget(QtWidgets.QLabel("Show moves ahead:"))
+        self.puzzle_lookahead_spin = self._spin(0, 12, max(0, self.cfg.puzzle_lookahead))
+        self.puzzle_lookahead_spin.setToolTip(
+            "How many half-moves PAST the move to play now to also draw, as a fading line "
+            "(your moves green, current gold, opponent replies red). 0 = just the next "
+            "move. This is display-only — it does not slow the engine.")
+        arow.addWidget(self.puzzle_lookahead_spin)
+        arow.addStretch(1)
+        pf.addLayout(arow)
+        self.puzzle_winning_cb = QtWidgets.QCheckBox("Show only your side's moves (hide opponent replies)")
         self.puzzle_winning_cb.setChecked(self.cfg.puzzle_winning_only)
         pf.addWidget(self.puzzle_winning_cb)
+        self.puzzle_highlight_cb = QtWidgets.QCheckBox("Use last-move highlight to fix the side (all themes)")
+        self.puzzle_highlight_cb.setChecked(self.cfg.puzzle_use_highlight)
+        self.puzzle_highlight_cb.setToolTip(
+            "Optional, gated layer: read the site's last-move square highlight to pin whose "
+            "move it is with near-certainty (fixes the ~10% side misses). Self-calibrates to "
+            "any theme, runs off the main thread, and NEVER touches piece recognition — if "
+            "it can't read a highlight it simply abstains and the engine picks the side.")
+        pf.addWidget(self.puzzle_highlight_cb)
         self.puzzle_auto_btn = QtWidgets.QPushButton("Auto-pick the side to solve")
         self.puzzle_auto_btn.setToolTip(
-            "Let the engine pick the decisive side. The 'Whose turn' buttons override "
-            "this (force White/Black to move); this clears that override.")
+            "Let the engine pick the side. The 'Whose turn' buttons override this "
+            "(force White/Black to move); this clears that override.")
         pf.addWidget(self.puzzle_auto_btn)
         self.puzzle_note = QtWidgets.QLabel(
-            "Shows the decisive side's single best move (both sides analysed). Eval "
-            "engines only.")
+            "Solves the on-screen position and streams the forced solution (like live). The "
+            "side is found once and tracked as you play. Eval engines only.")
         self.puzzle_note.setWordWrap(True)
         pf.addWidget(self.puzzle_note)
 
@@ -572,6 +595,8 @@ class MenuWindow(QtWidgets.QWidget):
         self.mode_puzzle_radio.toggled.connect(self._on_play_mode_changed)
         self.puzzle_auto_btn.clicked.connect(self._on_puzzle_auto)
         self.puzzle_winning_cb.toggled.connect(self._on_puzzle_winning_toggled)
+        self.puzzle_lookahead_spin.valueChanged.connect(self._on_puzzle_lookahead_changed)
+        self.puzzle_highlight_cb.toggled.connect(self._on_puzzle_highlight_toggled)
         self.strength_preset.currentIndexChanged.connect(self._on_strength_preset)
         self.strength_slider.valueChanged.connect(self._on_strength_slider)
         # Engine selection + per-engine option controls.
@@ -705,7 +730,7 @@ class MenuWindow(QtWidgets.QWidget):
         self._reanalyze_current()               # Elos are per-request; no rebuild needed
 
     def _start_analysis(self, board: chess.Board) -> None:
-        puzzle = self.cfg.play_mode == "puzzle" and not self._is_policy_engine()  # eval engines only
+        puzzle = self._puzzle_active()                       # eval engines only
         # Puzzle mode picks the side itself (it analyses each colour), so the
         # tracker's assumed turn can make the position 'invalid' (the side not to
         # move is in check) while it is still a perfectly good puzzle — skip the
@@ -724,7 +749,9 @@ class MenuWindow(QtWidgets.QWidget):
             # auto-respawns the engine if Stockfish rejects the position.
         if self._controller is None:
             return
-        self._analyzing_key = self._pos_key(board)
+        # Puzzle dedup keys on placement + the side we solve (not the tracker's turn),
+        # so tracker-turn noise can't retrigger; live keys on placement + turn.
+        self._analyzing_key = self._puzzle_key(board) if puzzle else self._pos_key(board)
         self._req_id += 1
         # Strength inputs differ per engine: Stockfish uses the simulated-Elo limiter
         # on player_elo; Maia 2 uses your/opponent rating (no limiter). Leela ignores
@@ -922,27 +949,10 @@ class MenuWindow(QtWidgets.QWidget):
         if token != self._req_id:        # stale emit from a superseded request
             return
         try:
+            if self._puzzle_active():
+                self._on_puzzle_updated(suggestions, board)
+                return
             policy = self._is_policy_engine()    # Maia: show human-move probabilities
-            puzzle = self.cfg.play_mode == "puzzle" and not policy
-            # In puzzle mode the greens are the (engine-determined) side-to-move's best
-            # and the reds are the other side; 'winning side only' hides the reds.
-            show_opp = (not self.cfg.puzzle_winning_only) if puzzle else self.cfg.show_predicted
-            # Winning-side-only: the greens are the SIDE-TO-MOVE's best move. After you
-            # play the solution it becomes the OPPONENT's turn, so that "best move" is
-            # their forced reply — losing for them. That is not the winning side's move,
-            # so suppress it (you'll see your next move once the opponent has replied)
-            # instead of flashing the opponent's move as if it were the solution.
-            if puzzle and self.cfg.puzzle_winning_only and suggestions:
-                top = suggestions[0]
-                side_to_move_winning = (
-                    (top.mate_in is not None and top.mate_in > 0)            # they mate
-                    or (top.mate_in is None and top.score_cp is not None     # or are ahead
-                        and top.score_cp >= 0))
-                opponent_reply = not side_to_move_winning                    # losing -> their forced reply
-            else:
-                opponent_reply = False
-            if opponent_reply:
-                suggestions = []
             self.results_list.clear()
             flip = board.turn != chess.WHITE     # show eval ABSOLUTE (white +, black -)
             for s in suggestions:
@@ -952,23 +962,14 @@ class MenuWindow(QtWidgets.QWidget):
                     san = s.uci
                 value = f"{(s.policy or 0.0) * 100:.0f}%" if policy else s.eval_text_pov(flip)
                 self.results_list.addItem(f"#{s.rank}  {san:7s} {value}")
-            self._suggestions = build_annotations(suggestions, opp_suggestions, show_opp,
+            self._suggestions = build_annotations(suggestions, opp_suggestions,
+                                                  self.cfg.show_predicted,
                                                   board.turn == chess.WHITE, self.cfg.gold_moves,
                                                   policy_mode=policy)
+            self._filter_arrows = True
             self._draw_arrows()
-            if opponent_reply:
-                side = "White" if board.turn == chess.WHITE else "Black"
-                self.status_label.setText(
-                    f"Puzzle — {side} (opponent) to reply; waiting for your move "
-                    f"(winning side only).")
-            elif not suggestions:
+            if not suggestions:
                 self.status_label.setText(self._terminal_status(board, opp_suggestions))
-            elif puzzle:
-                side = "White" if board.turn == chess.WHITE else "Black"
-                how = "you forced" if self._puzzle_side is not None else "decisive side"
-                extra = "" if self.cfg.puzzle_winning_only else " — other side's best in red"
-                self.status_label.setText(
-                    f"Puzzle — {side} to move ({how}). Best move for {side}{extra}.")
             else:
                 note = ""
                 if opp_suggestions:
@@ -985,6 +986,81 @@ class MenuWindow(QtWidgets.QWidget):
                 self.status_label.setText(f"{head}.{note}")
         except Exception as exc:
             self.status_label.setText(f"render error: {exc}")
+
+    @staticmethod
+    def _stm_winning(top) -> bool:
+        """Is the side to move the WINNING (hero) side? After you play the solution it
+        becomes the opponent's turn and their 'best' is a losing forced reply — that's
+        how we tell a hero-to-move position from an opponent-to-reply one."""
+        if top.mate_in is not None:
+            return top.mate_in > 0
+        return top.score_cp is not None and top.score_cp >= 0
+
+    def _on_puzzle_updated(self, suggestions: list, board: chess.Board) -> None:
+        """Render a solved puzzle: the whole forced line as fading arrows (your moves
+        green, the move to play now gold, the opponent's forced replies red), or — with
+        'show full solution' off — just the single best move. ``board.turn`` is the side
+        the engine solved for."""
+        # Cache the engine's one-time side pick; parity tracks it from here. The tracker
+        # stays turn-unknown until you move, so a cold-wrong pick self-corrects then.
+        if self._puzzle_side is None and suggestions:
+            self._puzzle_side = board.turn
+            self._puzzle_side_source = "engine"      # highlight abstained → the cold pick
+            self._analyzing_key = self._puzzle_key(board)
+        self.results_list.clear()
+        if not suggestions:
+            self._suggestions = []
+            self._filter_arrows = True
+            self._draw_arrows()
+            self.status_label.setText(self._terminal_status(board, []))
+            return
+        top = suggestions[0]
+        if self._puzzle_side_forced:
+            stm_winning = True                       # you chose this side — show it as yours
+            hero_white = (board.turn == chess.WHITE)
+        else:
+            stm_winning = self._stm_winning(top)
+            hero_white = (board.turn == chess.WHITE) if stm_winning else (board.turn != chess.WHITE)
+        show_opp = not self.cfg.puzzle_winning_only
+        side = "White" if board.turn == chess.WHITE else "Black"
+        how = self._puzzle_side_source
+        self._fill_puzzle_results(top, board, hero_white)
+        # Winning-only + it's the opponent's forced (losing) reply: suppress and wait for
+        # your move, rather than flash their move as if it were the solution.
+        if self.cfg.puzzle_winning_only and not stm_winning:
+            self._suggestions = []
+            self._filter_arrows = True
+            self._draw_arrows()
+            self.status_label.setText(
+                f"Puzzle — {side} (opponent) to reply; waiting for your move (winning side only).")
+            return
+        ahead = max(0, self.cfg.puzzle_lookahead)
+        max_plies = 1 + ahead                    # the move to play now + N half-moves ahead
+        self._suggestions = build_puzzle_line(top, board, hero_white, show_opp, max_plies=max_plies)
+        # A lone current move can use the live off-board filter (it clears the instant the
+        # piece moves); a multi-ply line can't (its later source squares aren't occupied
+        # yet), so it draws unfiltered and is refreshed wholesale each move.
+        self._filter_arrows = (len(self._suggestions) <= 1)
+        self._draw_arrows()
+        tail = "" if show_opp else ", your side only"
+        if ahead == 0:
+            self.status_label.setText(f"Puzzle — {side} to move ({how}). Best move{tail}.")
+        else:
+            self.status_label.setText(
+                f"Puzzle solution ({how}) — {side} to move, {ahead} ahead{tail}.")
+
+    def _fill_puzzle_results(self, top, board: chess.Board, hero_white: bool) -> None:
+        """List the solution line as SAN in the results box (you/opponent tagged)."""
+        walk = board.copy()
+        n = 1 + max(0, self.cfg.puzzle_lookahead)
+        for i, mv in enumerate(top.pv[:n]):
+            try:
+                san = walk.san(mv)
+            except Exception:
+                break
+            who = "you" if ((walk.turn == chess.WHITE) == hero_white) else "opp"
+            self.results_list.addItem(f"{'►' if i == 0 else ' '} {san:8s} ({who})")
+            walk.push(mv)
 
     @staticmethod
     def _terminal_status(board: chess.Board, opp_suggestions: list) -> str:
@@ -1275,7 +1351,8 @@ class MenuWindow(QtWidgets.QWidget):
         self.tracker.reset()
         self._reset_tracking_state()
         worker = VisionWorker(self.vision, lambda: self._cap_region,
-                              lambda: self.cfg.white_bottom, interval_ms=TICK_MS)
+                              lambda: self.cfg.white_bottom, interval_ms=TICK_MS,
+                              highlight_fn=lambda: self.cfg.puzzle_use_highlight and self._puzzle_active())
         worker.frame.connect(self._on_frame)     # queued to the GUI thread
         self._vision_worker = worker
         worker.start()
@@ -1295,6 +1372,10 @@ class MenuWindow(QtWidgets.QWidget):
         self._believed = None
         self._consensus.clear()
         self._puzzle_side = None        # a fresh position re-auto-picks the puzzle side
+        self._puzzle_side_forced = False
+        self._puzzle_side_source = "auto"
+        self._puzzle_anchor = None
+        self._last_highlight = None
         self._orient_locked_key = None  # ...and re-enables one auto-orient on it
 
     def _update_certainty(self, conf: float) -> None:
@@ -1303,10 +1384,11 @@ class MenuWindow(QtWidgets.QWidget):
     def _refresh_turn_label(self) -> None:
         if self.cfg.play_mode == "puzzle":
             if self._puzzle_side is None:
-                self.turn_label.setText("Solving: auto (the decisive side)")
+                self.turn_label.setText("Solving: auto (engine picks the side)")
             else:
                 self.turn_label.setText(
-                    f"Solving: {'White' if self._puzzle_side else 'Black'} to move (you forced)")
+                    f"Solving: {'White' if self._puzzle_side else 'Black'} to move "
+                    f"({self._puzzle_side_source})")
             return
         side = "White" if self.tracker.board.turn else "Black"
         mine = "you" if self.tracker.board.turn == self._player_color() else "opponent"
@@ -1318,6 +1400,8 @@ class MenuWindow(QtWidgets.QWidget):
         force which side we solve for (overriding the auto-picked decisive side)."""
         if self.cfg.play_mode == "puzzle":
             self._puzzle_side = bool(white_to_move)
+            self._puzzle_side_forced = True
+            self._puzzle_side_source = "you set"
             self._refresh_turn_label()
             self._reanalyze_current()
             self.status_label.setText(
@@ -1341,6 +1425,9 @@ class MenuWindow(QtWidgets.QWidget):
         self.cfg.play_mode = "puzzle" if self.mode_puzzle_radio.isChecked() else "live"
         self.cfg.save()
         self._puzzle_side = None                     # a fresh mode auto-picks the side
+        self._puzzle_side_forced = False
+        self._puzzle_side_source = "auto"
+        self._puzzle_anchor = None
         self._apply_play_mode()
         if self.cfg.play_mode == "puzzle" and self._is_policy_engine():
             self.status_label.setText(
@@ -1352,16 +1439,34 @@ class MenuWindow(QtWidgets.QWidget):
         self._reanalyze_current()
 
     def _on_puzzle_auto(self) -> None:
-        self._puzzle_side = None
+        hl = self._highlight_side()                   # prefer the highlight if it read one
+        self._puzzle_side = hl
+        self._puzzle_side_forced = False
+        self._puzzle_side_source = "move-highlight" if hl is not None else "engine"
         self._refresh_turn_label()
         self._reanalyze_current()
-        self.status_label.setText("Puzzle — auto-picking the decisive side.")
+        self.status_label.setText("Puzzle — auto-picking the side.")
 
     def _on_puzzle_winning_toggled(self, on: bool) -> None:
         if self._loading:
             return
         self.cfg.puzzle_winning_only = on
         self.cfg.save()
+        self._reanalyze_current()
+
+    def _on_puzzle_lookahead_changed(self, value: int) -> None:
+        if self._loading:
+            return
+        self.cfg.puzzle_lookahead = int(value)
+        self.cfg.save()
+        self._reanalyze_current()
+
+    def _on_puzzle_highlight_toggled(self, on: bool) -> None:
+        if self._loading:
+            return
+        self.cfg.puzzle_use_highlight = on
+        self.cfg.save()
+        self._puzzle_anchor = None        # re-read the side (highlight or engine) for this position
         self._reanalyze_current()
 
     def _on_track_toggled(self, on: bool) -> None:
@@ -1390,11 +1495,12 @@ class MenuWindow(QtWidgets.QWidget):
         left, top, w, h = self._cap_region
         return left <= x < left + w and top <= y < top + h
 
-    def _on_frame(self, raw: chess.Board, debug: list) -> None:
+    def _on_frame(self, raw: chess.Board, debug: list, highlight=None) -> None:
         try:
             if self.cfg.pause_on_drag and self._dragging_on_board():
                 return   # piece held on the board: freeze the eval, keep current arrows,
                          # and don't feed mid-drag junk to the engine
+            self._last_highlight = highlight     # optional last-move read (None when off/unclear)
             frame_cert = certainty(debug)
             self._cert_ema = 0.6 * self._cert_ema + 0.4 * frame_cert
             self._update_certainty(self._cert_ema)
@@ -1407,7 +1513,10 @@ class MenuWindow(QtWidgets.QWidget):
                          and agreement >= AGREEMENT_MIN)
             if confident:
                 self._no_board = 0
-                self._reconcile(self._believed)
+                if self._puzzle_active():
+                    self._reconcile_puzzle(self._believed)
+                else:
+                    self._reconcile(self._believed)
                 self._update_orientation_belief()
             elif frame_cert < NO_BOARD_CERT:
                 self._no_board += 1
@@ -1440,19 +1549,88 @@ class MenuWindow(QtWidgets.QWidget):
             if self._resync_count >= RESYNC_CONFIRM:
                 self.tracker.reset(board, previous=self.tracker.board.copy())
                 self._resync_fen = None
-                self._puzzle_side = None       # a board jump = a new puzzle; re-guess the side
                 self._after_commit()
                 self.status_label.setText("Resynced to the current board.")
             return
         # Legal move, or no change: the tracker now matches the board.
-        if moves and self.cfg.play_mode == "puzzle":
-            # A real move tells us whose turn it actually is now, so make green that
-            # side for the REST OF THIS PUZZLE — this corrects a wrong auto-guess once
-            # you play the right move. Cleared on the next board jump (new puzzle); the
-            # field is read only in puzzle mode, so it never bleeds into live play.
-            self._puzzle_side = self.tracker.board.turn
         self._resync_fen = None
         self._after_commit()
+
+    def _puzzle_active(self) -> bool:
+        """Puzzle mode AND an eval engine (Maia plays normally even in puzzle mode)."""
+        return self.cfg.play_mode == "puzzle" and not self._is_policy_engine()
+
+    def _highlight_side(self) -> bool | None:
+        """The side to move read from the last-move highlight, if enabled and confident —
+        the near-certain override for the engine's ~91% cold pick. None => abstain."""
+        h = self._last_highlight
+        if (self.cfg.puzzle_use_highlight and h is not None
+                and getattr(h, "side_to_move", None) is not None):
+            return h.side_to_move
+        return None
+
+    def _reconcile_puzzle(self, board: chess.Board) -> None:
+        """Puzzle reconcile — anchored on PLACEMENT, with the side tracked by PARITY.
+
+        The side to move is determined ONCE per puzzle (the engine's pick, or your
+        override) and then strictly alternates as moves are played — it never re-guesses
+        per frame, which is what made it flip mid-puzzle (the 'two moves in a row for the
+        same side' bug) and ran the both-sides search constantly (the slowness).
+
+        ``tracker.update_to`` follows up to TWO plies, so a site that auto-plays the
+        opponent's reply still lands on the right side, and it infers the mover's colour
+        from the pieces — so even a COLD-WRONG initial pick self-corrects the instant you
+        play the real move (the tracker is left turn-unknown until then, so the observed
+        move, not the guess, fixes the parity). Only a genuine board jump (a new puzzle)
+        re-opens the one-time pick."""
+        fen = board.board_fen()
+        if fen == self._puzzle_anchor:
+            return                                   # same position — analysis already handled it
+        moves = self.tracker.update_to(board)
+        if moves:                                    # one or two real moves: parity is now exact
+            self._puzzle_side = self.tracker.board.turn
+            self._puzzle_side_forced = False         # a played move supersedes any manual pin
+            self._puzzle_side_source = "tracked"
+            self._resync_fen = None
+            self._suggestions = []                   # the move changed the position — drop the stale line
+        elif moves is None:                          # a jump: new puzzle (or >2 ply / churn)
+            if fen == self._resync_fen:
+                self._resync_count += 1
+            else:
+                self._resync_fen, self._resync_count = fen, 1
+            if self._resync_count < RESYNC_CONFIRM:   # let a mid-drag transient settle first
+                return
+            self._resync_fen = None
+            self.tracker.reset(board)                # placement only; turn UNKNOWN until a move
+            self._puzzle_side = None                 # re-pick the side once for the new puzzle
+            self._puzzle_side_forced = False
+            self._suggestions = []
+        # Side still unknown (new puzzle, or just entered puzzle mode): prefer the
+        # near-certain last-move HIGHLIGHT when enabled; else the engine cold-picks it on
+        # analysis. A played move (above) already set the side by parity, so this is
+        # skipped then — parity, being ground truth, always wins over the highlight.
+        if self._puzzle_side is None and not self._puzzle_side_forced:
+            hl = self._highlight_side()
+            self._puzzle_side = hl
+            self._puzzle_side_source = "move-highlight" if hl is not None else "engine"
+        # moves == [] : the tracker was already at this placement — only (re)establish the
+        # anchor; keep any arrows on screen.
+        self._puzzle_anchor = fen
+        self._refresh_turn_label()
+        self._after_commit_puzzle(board)
+
+    def _after_commit_puzzle(self, board: chess.Board) -> None:
+        """Re-analyse the puzzle only when the placement or the side to solve changes
+        (keyed on both, so vision noise on the tracker's turn can't retrigger it)."""
+        if self._puzzle_key(board) == self._analyzing_key:
+            return
+        self._refresh_moves()
+        self.fen_edit.setText(board.fen())
+        self._start_analysis(board)
+
+    def _puzzle_key(self, board: chess.Board) -> str:
+        side = "?" if self._puzzle_side is None else ("w" if self._puzzle_side else "b")
+        return board.board_fen() + "|" + side
 
     @staticmethod
     def _pos_key(board: chess.Board) -> str:
@@ -1478,7 +1656,13 @@ class MenuWindow(QtWidgets.QWidget):
             self._start_analysis(analyse)
 
     def _draw_arrows(self) -> None:
-        self.overlay.set_annotations(visible_annotations(self._believed, self._suggestions))
+        # Live / single-move: hide arrows whose source square is now empty (a moved
+        # piece's stale arrow vanishes). Solution lines show several plies ahead, whose
+        # source squares aren't occupied yet, so they bypass the filter and are instead
+        # refreshed wholesale when the position changes (see _reconcile_puzzle).
+        anns = (self._suggestions if not self._filter_arrows
+                else visible_annotations(self._believed, self._suggestions))
+        self.overlay.set_annotations(anns)
 
     def _refresh_orientation_indicator(self) -> None:
         show = self.cfg.show_orientation and self._geometry is not None

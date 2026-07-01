@@ -227,6 +227,45 @@ def build_annotations(suggestions, opp_suggestions=None, show_opponent=True,
     return anns
 
 
+# Solution-line fade: the move to play now is full strength; each step further down
+# the forced line is fainter, floored so even deep moves stay visible.
+LINE_FADE_STEP = 0.17
+LINE_MIN_STRENGTH = 0.30
+
+
+def build_puzzle_line(top, board, hero_is_white: bool, show_opponent: bool = True,
+                      max_plies: int = 8) -> list["Annotation"]:
+    """Fading arrows for a WHOLE forced solution, drawn at once.
+
+    ``top`` is the best line; its ``pv`` is walked from ``board`` (whose turn is the
+    side to move). The hero (winning) side's moves are GREEN — the immediate one
+    GOLD — and the opponent's forced replies RED; each step is fainter the deeper in
+    the line it sits, so the move to play now is the most opaque. Opponent arrows are
+    dropped when ``show_opponent`` is False ('winning side only'). The eval label sits
+    on the current move only, so the deeper arrows stay uncluttered."""
+    anns: list[Annotation] = []
+    if not top or not getattr(top, "pv", None):
+        return anns
+    flip = board.turn != chess.WHITE          # side-to-move POV -> ABSOLUTE (+White, -Black)
+    abs_cp = -top.score_cp if (flip and top.score_cp is not None) else top.score_cp
+    abs_mate = -top.mate_in if (flip and top.mate_in is not None) else top.mate_in
+    walk = board.copy()
+    for k, move in enumerate(top.pv[:max_plies]):
+        is_hero = ((walk.turn == chess.WHITE) == hero_is_white)
+        if is_hero or show_opponent:
+            strength = max(LINE_MIN_STRENGTH, 1.0 - k * LINE_FADE_STEP)
+            anns.append(Annotation(
+                move=move, rank=k + 1, opponent=not is_hero,
+                label=(top.eval_text_pov(flip) if k == 0 else ""),
+                score_cp=abs_cp, mate=abs_mate, strength=strength,
+                gold=(is_hero and k == 0), player_is_white=hero_is_white))
+        try:
+            walk.push(move)
+        except Exception:
+            break
+    return anns
+
+
 def visible_annotations(board, annotations):
     """Keep only arrows whose from-square holds a piece on ``board``.
 

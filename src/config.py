@@ -70,6 +70,14 @@ class Config:
     #     show only THAT side's single best move. Eval engines only (not Maia).
     play_mode: str = "live"          # "live" | "puzzle"
     puzzle_winning_only: bool = False  # puzzle: show only the winning side's move (hide the other side's)
+    # Puzzle look-ahead: how many half-moves PAST the current move to also draw (the
+    # solution line — your moves green, the current one gold, opponent replies red,
+    # fainter the deeper in the line). 0 = just the move to play now. Default 1.
+    puzzle_lookahead: int = 1
+    # Move-highlight side detection: an OPTIONAL, gated layer that reads the site's
+    # last-move square highlight to fix whose-move-it-is with certainty (off by default;
+    # never touches piece recognition — a wrong/absent read simply abstains).
+    puzzle_use_highlight: bool = False
     auto_track: bool = True          # auto-track the live board (engine analysis on by default)
 
     @classmethod

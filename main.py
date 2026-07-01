@@ -8,16 +8,18 @@ engine settings, and position analysis all live there. Run:
 from __future__ import annotations
 
 import faulthandler
+import gc
 import sys
 import threading
 import time
 import traceback
 from pathlib import Path
 
-from PySide6 import QtWidgets
+from PySide6 import QtCore, QtWidgets
 
 CRASH_LOG = Path(__file__).resolve().parent / "debug" / "crash.log"
 _fault_fh = None        # kept alive for the process lifetime so faulthandler can write
+_gc_timer = None        # kept alive so the GUI-thread collector keeps firing
 
 
 def _write_crash(where: str, exc_type, exc, tb) -> None:
@@ -60,6 +62,32 @@ def _install_crash_logging() -> None:
             pass
 
 
+def _install_gc_guard() -> None:
+    """Confine cyclic garbage collection to the GUI thread — the fix for the intermittent
+    segfault in debug/faulthandler.log (always 'Garbage-collecting' inside python-chess's
+    PV parser on the engine's background thread).
+
+    python-chess drives the engine through an asyncio loop in a BACKGROUND thread.
+    CPython's automatic cyclic collector runs on whichever thread crosses the allocation
+    threshold — often that busy parser thread. When a sweep there reaches a cycle that
+    touches a PySide6/Qt object, Qt's C++ deletion runs off the GUI thread and corrupts
+    the heap → the crash. Disabling AUTOMATIC collection stops any background thread from
+    ever running the collector (reference-count freeing is immediate and GIL-safe, so it
+    is unaffected); a GUI-thread timer performs the ONLY cyclic sweeps, where Qt objects
+    are safe to touch. Isolated engine churn never reproduced the crash; adding Qt did —
+    this targets exactly that interaction. Guarded so it can never block startup."""
+    global _gc_timer
+    try:
+        gc.disable()
+        gc.collect()
+        gc.freeze()                      # keep startup/import objects out of every sweep
+        _gc_timer = QtCore.QTimer()
+        _gc_timer.timeout.connect(gc.collect)
+        _gc_timer.start(2000)            # sweep cycles ~every 2 s, on the GUI thread only
+    except Exception:
+        pass
+
+
 def _enable_dpi_awareness() -> None:
     """Mark the process per-monitor DPI aware before Qt starts, so screen
     capture reports true physical pixels."""
@@ -80,6 +108,7 @@ def main() -> int:
     _install_crash_logging()
     _enable_dpi_awareness()
     app = QtWidgets.QApplication(sys.argv)
+    _install_gc_guard()                 # confine cyclic GC to the GUI thread (crash fix)
     from src.menu import MenuWindow      # imported after QApplication exists
     menu = MenuWindow(app)
     menu.show()

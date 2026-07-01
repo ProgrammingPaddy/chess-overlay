@@ -151,15 +151,17 @@ if sf:
         check("puzzle shows Black's mating move", cap.get("s")
               and cap["s"][0].move == chess.Move.from_uci("a8a1"))
         # the 'whose turn' override pins the side even against the eval (force Black on
-        # a White-to-mate position): greens become a Black move, reds stay White's mate.
+        # a White-to-mate position): the solved side becomes Black, its best line shown.
         cap.clear()
         cpz._analyze_puzzle(wmate, 1, 12, 3, forced_side=chess.BLACK)
         check("forced-side puzzle solves for the chosen side (Black)",
               cap.get("b") is not None and cap["b"].turn == chess.BLACK)
         check("forced-side puzzle shows a Black move", cap.get("s")
               and cap["b"].piece_at(cap["s"][0].move.from_square).color == chess.BLACK)
-        check("forced-side puzzle keeps the other side (White) as the reds",
-              cap.get("o") and cap["o"][0].move == chess.Move.from_uci("a1a8"))
+        # The opponent's forced replies now ride along inside the PV (the solution line
+        # the overlay draws), not a separate both-sides 'reds' pass.
+        check("forced-side puzzle returns a solution line (PV)",
+              cap.get("s") and len(cap["s"][0].pv) >= 1)
         # a puzzle is a single answer: multipv=1 yields exactly one green.
         cap.clear()
         cpz._analyze_puzzle(wmate, 1, 12, 4)

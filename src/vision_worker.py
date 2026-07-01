@@ -16,21 +16,26 @@ from src.capture import ScreenCapture
 
 
 class VisionWorker(QtCore.QThread):
-    frame = QtCore.Signal(object, object)   # (placement board, debug list)
+    frame = QtCore.Signal(object, object, object)   # (placement board, debug list, highlight|None)
 
     def __init__(self, vision, region_fn: Callable, orient_fn: Callable,
-                 interval_ms: int = 50, parent=None):
+                 interval_ms: int = 50, parent=None, highlight_fn: Callable | None = None):
         super().__init__(parent)
         self._vision = vision
         self._region_fn = region_fn        # () -> (left, top, w, h) | None
         self._orient_fn = orient_fn        # () -> white_bottom: bool
+        self._highlight_fn = highlight_fn  # () -> bool: read the last-move highlight this frame?
         self._interval = interval_ms
         self._stop = False
 
     def run(self) -> None:
+        from pathlib import Path
+        from src.highlight import detect_last_move, dump_highlight
+        debug_dir = Path(__file__).resolve().parent.parent / "debug"
         capture = ScreenCapture()
         last_img = last_board = last_debug = None
         last_orient = None
+        last_hl, hl_valid = None, False
         try:
             while not self._stop:
                 region = self._region_fn()
@@ -50,13 +55,24 @@ class VisionWorker(QtCore.QThread):
                     # squares depend on it, so a flip on a STATIC board (a puzzle) must
                     # re-map — otherwise the believed board lags the setting and the
                     # auto-orient logic oscillates.
-                    if (last_img is not None and img.shape == last_img.shape
-                            and orient == last_orient and np.array_equal(img, last_img)):
+                    same = (last_img is not None and img.shape == last_img.shape
+                            and orient == last_orient and np.array_equal(img, last_img))
+                    if same:
                         board, debug = last_board, last_debug
                     else:
                         board, debug = self._vision.analyze(img, orient)
                         last_img, last_board, last_debug, last_orient = img, board, debug, orient
-                    self.frame.emit(board, debug)
+                        hl_valid = False
+                    # Optional last-move highlight read — a SEPARATE colour-image pass that
+                    # never touches recognition. Cached with the frame (recomputed only on a
+                    # new image / when just enabled), so a still board costs nothing.
+                    hl = None
+                    if self._highlight_fn is not None and self._highlight_fn():
+                        if not (same and hl_valid):
+                            last_hl, hl_valid = detect_last_move(img, orient, board), True
+                            dump_highlight(debug_dir, img, orient, last_hl)   # debug/highlight.png
+                        hl = last_hl
+                    self.frame.emit(board, debug, hl)
                 except Exception:
                     pass
                 self.msleep(self._interval)
