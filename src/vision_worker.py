@@ -80,5 +80,8 @@ class VisionWorker(QtCore.QThread):
             capture.close()
 
     def stop(self) -> None:
+        # The loop checks _stop at the top of every iteration (each is ~one interval), so
+        # the join returns quickly; the generous timeout is only insurance against a slow
+        # capture/recognise mid-frame so we never drop the ref while the QThread still runs.
         self._stop = True
-        self.wait(1500)
+        self.wait(3000)

@@ -88,6 +88,20 @@ def _install_gc_guard() -> None:
         pass
 
 
+def _teardown_gc_guard() -> None:
+    """Undo the GC guard for a clean interpreter shutdown: stop the collector timer and
+    re-enable automatic GC. Worker threads are already joined by MenuWindow.closeEvent, so
+    the final teardown sweep no longer has a background thread to collide with."""
+    global _gc_timer
+    try:
+        if _gc_timer is not None:
+            _gc_timer.stop()
+            _gc_timer = None
+        gc.enable()
+    except Exception:
+        pass
+
+
 def _enable_dpi_awareness() -> None:
     """Mark the process per-monitor DPI aware before Qt starts, so screen
     capture reports true physical pixels."""
@@ -112,7 +126,10 @@ def main() -> int:
     from src.menu import MenuWindow      # imported after QApplication exists
     menu = MenuWindow(app)
     menu.show()
-    return app.exec()
+    try:
+        return app.exec()
+    finally:
+        _teardown_gc_guard()            # stop the collector + re-enable GC for a clean exit
 
 
 if __name__ == "__main__":

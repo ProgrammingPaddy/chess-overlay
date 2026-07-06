@@ -42,8 +42,8 @@ PROFILES: dict[str, EngineProfile] = {
     "maia2": EngineProfile(
         "maia2", "Maia 2 (human)", "policy",
         frozenset({"mode", "multipv", "player_elo", "opp_elo", "maia_model"}),
-        "Predicts the move a human of a given Elo would actually play "
-        "(probabilities, no search)."),
+        "Predicts the move a human would play — opponent-aware, banded Elo ~600–2600, a "
+        "single forward pass (no search; shows candidate moves, not a deep line)."),
 }
 
 ENGINE_ORDER = ["stockfish", "leela", "maia2"]
@@ -67,15 +67,18 @@ def availability(key: str) -> tuple[bool, str]:
 
 
 def leela_networks() -> list[tuple[str, str]]:
-    """(label, path) choices for the Leela engine: the strong general net plus the
-    Maia rating nets (which run on lc0 too, as a human-strength option)."""
+    """(label, path) choices for the Leela engine's WeightsFile: the strong general net,
+    plus the Maia-1 single-rating human nets. NB the Maia-1 nets are ordinary lc0 networks
+    (distinct from the separate Maia 2 engine): each emulates ONE fixed rating and runs
+    inside lc0 with lc0's eval/search — whereas the Maia 2 engine is a searchless model
+    with a tunable, opponent-aware Elo. They are labelled 'Maia-1 …' to keep that clear."""
     out: list[tuple[str, str]] = []
     strong = find_leela_network()
     if strong:
         import os
         out.append((f"Strong — {os.path.basename(strong)}", strong))
     for elo, path in list_maia_nets().items():
-        out.append((f"Human ~{elo} (Maia)", path))
+        out.append((f"Maia-1 human ~{elo} (lc0 net)", path))
     return out
 
 

@@ -38,8 +38,13 @@ FRAME_MIN = 0.45         # min per-frame match quality to treat it as a real boa
 NO_BOARD_CERT = 0.30     # sustained reads below this => clearly no board (clear arrows)
 NO_BOARD_FRAMES = 4
 RESYNC_CONFIRM = 2       # stable non-legal reads before resyncing (filters drags)
-MAIA_ELO_MIN = 1100      # Maia 2's trained rating range (values outside clamp)
-MAIA_ELO_MAX = 1900
+# Maia 2 accepts any Elo but BUCKETS it internally (maia2's create_elo_dict): everything
+# under 1100 is ONE band, everything 2000+ is ONE band, and 100-wide bands sit between.
+# Confirmed against the model — 600..1099 give identical play, as do 2000..2600. So the
+# full useful input range is 600–2600 (11 distinct levels); _maia_band spells out which.
+MAIA_ELO_MIN = 600
+MAIA_ELO_MAX = 2600
+MAIA_ELO_STEP = 100
 ORIENT_FLIP_P = 0.04     # CV must be >=96% sure the orientation is wrong to auto-flip
 ORIENT_FLIP_FRAMES = 4   # confident disagreeing frames required before auto-flipping
 
@@ -69,7 +74,7 @@ class MiniBoard(QtWidgets.QWidget):
         super().__init__()
         self._board = chess.Board.empty()
         self._white_bottom = True
-        self.setMinimumSize(220, 220)
+        self.setMinimumSize(150, 150)
 
     def set_board(self, board: chess.Board, white_bottom: bool = True) -> None:
         self._board = board
@@ -148,8 +153,8 @@ class MenuWindow(QtWidgets.QWidget):
         self._vision_worker: VisionWorker | None = None
 
         self.setWindowTitle("Chess Overlay")
-        self.setMinimumWidth(600)
-        self.resize(640, 720)
+        self.setMinimumWidth(680)       # 2-column rows need a little width to breathe
+        self.resize(820, 600)           # wider but shorter than before (was 640x720)
         self._build_ui()
 
         self.overlay.show()
@@ -232,10 +237,15 @@ class MenuWindow(QtWidgets.QWidget):
         for cb in (self.show_arrows_cb, self.gold_moves_cb, self.show_border_cb,
                    self.show_orient_cb, self.auto_orient_cb):
             ov.addWidget(cb)
-        v.addWidget(overlay)
+        ov.addStretch(1)
 
+        # Board and Overlay side by side — trade width for height (see _row).
+        v.addLayout(self._row(board, overlay))
+
+        # Piece recognition: the controls on the left, the live mini-board on the right.
         vision = QtWidgets.QGroupBox("Piece recognition")
-        vv = QtWidgets.QVBoxLayout(vision)
+        vg = QtWidgets.QHBoxLayout(vision)
+        left = QtWidgets.QVBoxLayout()
         row = QtWidgets.QHBoxLayout()
         self.calib_vision_btn = QtWidgets.QPushButton("Calibrate vision (start position)")
         self.calib_vision_btn.setToolTip(
@@ -244,7 +254,7 @@ class MenuWindow(QtWidgets.QWidget):
         self.recognize_btn = QtWidgets.QPushButton("Recognize now")
         row.addWidget(self.calib_vision_btn)
         row.addWidget(self.recognize_btn)
-        vv.addLayout(row)
+        left.addLayout(row)
         trow = QtWidgets.QHBoxLayout()
         trow.addWidget(QtWidgets.QLabel("Theme:"))
         self.theme_combo = QtWidgets.QComboBox()
@@ -256,22 +266,28 @@ class MenuWindow(QtWidgets.QWidget):
         trow.addWidget(self.theme_combo, 1)
         trow.addWidget(self.theme_save_btn)
         trow.addWidget(self.theme_delete_btn)
-        vv.addLayout(trow)
+        left.addLayout(trow)
         self.allow_illegal_cb = QtWidgets.QCheckBox(
             "Allow illegal moves (accept any read, skip legality check)")
         self.allow_illegal_cb.setChecked(self.cfg.allow_illegal)
-        vv.addWidget(self.allow_illegal_cb)
+        left.addWidget(self.allow_illegal_cb)
         self.certainty_bar = QtWidgets.QProgressBar()
         self.certainty_bar.setRange(0, 100)
         self.certainty_bar.setFormat("Read certainty: %p%")
-        vv.addWidget(self.certainty_bar)
+        left.addWidget(self.certainty_bar)
         self.vision_status = QtWidgets.QLabel()
         self.vision_status.setWordWrap(True)
-        vv.addWidget(self.vision_status)
-        vv.addWidget(QtWidgets.QLabel("What the CV sees:"))
+        left.addWidget(self.vision_status)
+        left.addStretch(1)
+        vg.addLayout(left, 1)
+        right = QtWidgets.QVBoxLayout()
+        right.addWidget(QtWidgets.QLabel("What the CV sees:"))
         self.mini_board = MiniBoard()
-        vv.addWidget(self.mini_board, 1)
-        v.addWidget(vision, 1)
+        right.addWidget(self.mini_board)
+        right.addStretch(1)
+        vg.addLayout(right)
+        v.addWidget(vision)
+        v.addStretch(1)
         return w
 
     def _tab_engine(self) -> QtWidgets.QWidget:
@@ -363,7 +379,10 @@ class MenuWindow(QtWidgets.QWidget):
         self.leela_net_combo.setToolTip(
             "Leela's strength/style IS its network. The strong general net plays at a "
             "high level; a Maia rating net plays human-like at that Elo.")
-        l_note = QtWidgets.QLabel("Strength = the network. Strong general net, or a Maia rating net for human play.")
+        l_note = QtWidgets.QLabel(
+            "Strength = the network. The strong net plays at a high level; a 'Maia-1' net "
+            "emulates ONE fixed rating (human-style, inside lc0). For tunable, opponent-aware "
+            "human play, use the separate Maia 2 engine instead.")
         l_note.setWordWrap(True)
         lf.addRow(l_note)
         v.addWidget(self.leela_group)
@@ -395,10 +414,14 @@ class MenuWindow(QtWidgets.QWidget):
         mf.addRow("", self.opp_elo_value)
         mf.addRow("Model", self.maia_model_combo)
         m_note = QtWidgets.QLabel(
-            f"Predicts the moves a human of that rating would play (Maia is trained on "
-            f"{MAIA_ELO_MIN}–{MAIA_ELO_MAX}; values outside clamp).")
+            "Predicts the move a human would play; BOTH ratings condition the model. Works "
+            "in bands (600–2600): under-1100 and 2000+ each behave as one level, with "
+            "100-point bands between. No search — it shows candidate moves ('Lines'), not a "
+            "deep line.")
         m_note.setWordWrap(True)
         mf.addRow(m_note)
+        # Strength / Leela / Maia are mutually exclusive (see _apply_engine_profile hides
+        # the inactive ones), so stacking them costs no height — only the active one shows.
         v.addWidget(self.maia_group)
 
         v.addStretch(1)
@@ -450,6 +473,8 @@ class MenuWindow(QtWidgets.QWidget):
 
         # Whose turn — the weakest signal, so make it explicit and overridable.
         turn = QtWidgets.QGroupBox("Whose turn")
+        turn.setToolTip("Live: fix whose turn it is if the tracker drifts. Puzzle: force "
+                        "which side to solve for (overrides the auto-pick).")
         tf = QtWidgets.QVBoxLayout(turn)
         self.turn_label = QtWidgets.QLabel("To move: —")
         tf.addWidget(self.turn_label)
@@ -463,14 +488,12 @@ class MenuWindow(QtWidgets.QWidget):
         tgrid.addWidget(self.turn_mine_btn, 1, 0)
         tgrid.addWidget(self.turn_opp_btn, 1, 1)
         tf.addLayout(tgrid)
-        turn_note = QtWidgets.QLabel(
-            "Live: fix whose turn it is if the tracker drifts. Puzzle: force which side "
-            "to solve for (overrides the auto-pick).")
-        turn_note.setWordWrap(True)
-        tf.addWidget(turn_note)
 
         # Puzzle options — only meaningful in Puzzle mode (disabled in Live play).
         self.puzzle_group = QtWidgets.QGroupBox("Puzzle options")
+        self.puzzle_group.setToolTip(
+            "Solves the on-screen position and streams the forced solution (like live). The "
+            "side is found once and tracked as you play. Eval engines only.")
         pf = QtWidgets.QVBoxLayout(self.puzzle_group)
         arow = QtWidgets.QHBoxLayout()
         arow.addWidget(QtWidgets.QLabel("Show moves ahead:"))
@@ -498,11 +521,6 @@ class MenuWindow(QtWidgets.QWidget):
             "Let the engine pick the side. The 'Whose turn' buttons override this "
             "(force White/Black to move); this clears that override.")
         pf.addWidget(self.puzzle_auto_btn)
-        self.puzzle_note = QtWidgets.QLabel(
-            "Solves the on-screen position and streams the forced solution (like live). The "
-            "side is found once and tracked as you play. Eval engines only.")
-        self.puzzle_note.setWordWrap(True)
-        pf.addWidget(self.puzzle_note)
 
         # Live-play options.
         live = QtWidgets.QGroupBox("Live play options")
@@ -516,7 +534,7 @@ class MenuWindow(QtWidgets.QWidget):
         for cb in (self.track_cb, self.predict_cb, self.pause_drag_cb):
             lo.addWidget(cb)
 
-        # Two columns so the panel isn't so tall.
+        # Side-by-side groups (see _row) so the panel stays short.
         v.addLayout(self._row(mode, colour))
         v.addLayout(self._row(turn, self.puzzle_group))
         v.addWidget(live)
@@ -540,15 +558,15 @@ class MenuWindow(QtWidgets.QWidget):
                   self.reset_game_btn, self.snapshot_btn):
             row.addWidget(b)
         v.addLayout(row)
-        self.results_list = QtWidgets.QListWidget()
-        self.results_list.setFixedHeight(84)
-        v.addWidget(self.results_list)
         self.opening_label = QtWidgets.QLabel("Opening: —")
         v.addWidget(self.opening_label)
+        # The two read-out panes (candidate moves + the game line) side by side.
+        self.results_list = QtWidgets.QListWidget()
+        self.results_list.setFixedHeight(72)
         self.moves_view = QtWidgets.QPlainTextEdit()
         self.moves_view.setReadOnly(True)
-        self.moves_view.setFixedHeight(64)
-        v.addWidget(self.moves_view)
+        self.moves_view.setFixedHeight(72)
+        v.addLayout(self._row(self.results_list, self.moves_view))
         return w
 
     @staticmethod
@@ -667,16 +685,40 @@ class MenuWindow(QtWidgets.QWidget):
         self.strength_group.setVisible("strength_elo" in f)
         self.leela_group.setVisible("leela_network" in f)
         self.maia_group.setVisible("player_elo" in f)
+        self._sync_mode_combo()
+
+    def _sync_mode_combo(self) -> None:
+        """Mode choices depend on the engine. A searcher refines over depth (Live vs Fixed);
+        Maia 2 is a SINGLE forward pass, so it offers only Standard vs Predictive — a
+        Fixed-depth search mode is meaningless there and isn't shown (don't shoehorn search
+        onto Maia). The data values stay shared, so switching engines keeps the mode sane."""
+        self.mode_combo.blockSignals(True)
+        self.mode_combo.clear()
+        if self.cfg.engine == "maia2":
+            self.mode_combo.addItem("Standard (one pass)", "live")
+            self.mode_combo.addItem("Predictive (a reply to each likely move)", "predictive")
+        else:
+            self.mode_combo.addItem("Live (instant, refines)", "live")
+            self.mode_combo.addItem("Fixed depth (strong)", "fixed")
+            self.mode_combo.addItem("Predictive (a reply to each likely move)", "predictive")
+        i = self.mode_combo.findData(self.cfg.engine_mode)
+        if i < 0:                       # saved mode not offered here (e.g. Fixed while on Maia)
+            i = 0
+            self.cfg.engine_mode = self.mode_combo.itemData(0)
+        self.mode_combo.setCurrentIndex(i)
+        self.mode_combo.blockSignals(False)
 
     @staticmethod
     def _maia_band(elo: int) -> str:
-        if elo <= MAIA_ELO_MIN:
-            return "beginner"
-        if elo < 1400:
-            return "casual"
-        if elo < 1700:
-            return "intermediate"
-        return "advanced club"
+        """The EFFECTIVE Maia band for an Elo (see MAIA_ELO_MIN note): sub-1100 and 2000+
+        are each a single band, so the label states the real granularity rather than
+        implying a continuous scale."""
+        if elo < 1100:
+            return "under-1100 band (all sub-1100 alike)"
+        if elo >= 2000:
+            return "2000+ band (all 2000+ alike)"
+        lo = (elo // 100) * 100
+        return f"{lo}–{lo + 99} band"
 
     def _sync_maia_controls(self) -> None:
         # Clamp persisted values to Maia's trained range so the UI reflects reality.
@@ -723,9 +765,11 @@ class MenuWindow(QtWidgets.QWidget):
     def _on_maia_elo_changed(self, *_) -> None:
         if self._loading:
             return
-        self.cfg.maia_player_elo = self.player_elo_slider.value()
-        self.cfg.maia_opp_elo = self.opp_elo_slider.value()
-        self._sync_maia_controls()
+        def snap(v):
+            return int(round(v / MAIA_ELO_STEP) * MAIA_ELO_STEP)
+        self.cfg.maia_player_elo = snap(self.player_elo_slider.value())
+        self.cfg.maia_opp_elo = snap(self.opp_elo_slider.value())
+        self._sync_maia_controls()          # writes the snapped value back + refreshes the band
         self.cfg.save()
         self._reanalyze_current()               # Elos are per-request; no rebuild needed
 
@@ -1359,9 +1403,11 @@ class MenuWindow(QtWidgets.QWidget):
         return True
 
     def _stop_tracking(self) -> None:
-        if self._vision_worker is not None:
-            self._vision_worker.stop()
-            self._vision_worker = None
+        # Clear the field FIRST, then join: a frame signal already queued to the GUI thread
+        # can fire during the join, and it must not see a half-stopped worker.
+        worker, self._vision_worker = self._vision_worker, None
+        if worker is not None:
+            worker.stop()
 
     def _reset_tracking_state(self) -> None:
         self._resync_fen = self._analyzing_key = None
@@ -1799,10 +1845,18 @@ class MenuWindow(QtWidgets.QWidget):
 
     # ---------------------------------------------------------------- lifecycle
     def closeEvent(self, e: QtGui.QCloseEvent) -> None:
-        self._stop_tracking()
-        if self._controller is not None:
-            self._controller.shutdown()
-        if self._capture is not None:
-            self._capture.close()
+        # Stop every worker BEFORE the process tears down. With automatic GC disabled
+        # (main._install_gc_guard), a thread still touching Qt / python-chess objects during
+        # interpreter shutdown can crash — so join them here, each step isolated so one
+        # hang or error can't skip the rest.
+        for cleanup in (
+                self._stop_tracking,                                       # vision capture QThread
+                lambda: self._controller and self._controller.shutdown(),  # engine QThread (+ its asyncio thread)
+                lambda: self._capture and self._capture.close()):          # main-thread screen capture
+            try:
+                cleanup()
+            except Exception:
+                pass
+        self._controller = None
         self._app.quit()
         super().closeEvent(e)

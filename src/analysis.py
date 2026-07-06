@@ -193,8 +193,12 @@ class EngineController(QtCore.QThread):
     def _quit_engine(self) -> None:
         if self._engine is not None:
             try:
-                self._engine.quit()
+                self._engine.quit()      # ask the engine process to exit (blocks briefly)
             except Exception:
+                pass
+            try:
+                self._engine.close()     # end python-chess's OWN background asyncio thread
+            except Exception:            # (quit alone leaves it to end on pipe-EOF)
                 pass
             self._engine = None
 
