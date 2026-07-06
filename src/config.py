@@ -74,6 +74,9 @@ class Config:
     # solution line — your moves green, the current one gold, opponent replies red,
     # fainter the deeper in the line). 0 = just the move to play now. Default 1.
     puzzle_lookahead: int = 1
+    # Label the solution arrows with their move number in the line (1 = move to play now,
+    # 2 = next, …) instead of the eval. Moves landing on the same square share a label.
+    puzzle_move_numbers: bool = False
     # Move-highlight side detection: an OPTIONAL, gated layer that reads the site's
     # last-move square highlight to fix whose-move-it-is with certainty (off by default;
     # never touches piece recognition — a wrong/absent read simply abstains).

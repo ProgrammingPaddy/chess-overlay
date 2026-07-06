@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import chess
 from src.engine import MoveSuggestion, win_prob_to_cp
 from src.overlay import (DARK_RED, GOLD, GREEN, GREY, RED, _arrow_color,
-                         _eval_text_color, build_annotations)
+                         _eval_text_color, build_annotations, build_puzzle_line)
 
 GREEN_NUM = (120, 240, 150)
 RED_NUM = (255, 95, 95)
@@ -136,6 +136,21 @@ pol_b = build_annotations([psug("e7e5", 0.4, 0.3, 1)], None, show_opponent=False
                           white_to_move=False, gold_enabled=True, policy_mode=True)
 check("policy arrow grey when the player is worse", rgb(_arrow_color(pol_b[0])) == GREY,
       rgb(_arrow_color(pol_b[0])))
+
+# --- puzzle solution-line move numbers (label 1,2,3…; same-square moves merge) ---
+_pb = chess.Board()                                                  # White to move
+_pv = [chess.Move.from_uci(u) for u in ("e2e4", "d7d5", "e4d5")]     # moves 2 & 3 both land on d5
+_top = MoveSuggestion(_pv[0], 50, None, pv=_pv, rank=1)
+_num = build_puzzle_line(_top, _pb, True, show_opponent=True, max_plies=8, move_numbers=True)
+check("move numbers: first arrow labelled 1", _num[0].label == "1", _num[0].label)
+check("move numbers: same-square moves merge to '2,3'",
+      [a.label for a in _num] == ["1", "2,3", ""], str([a.label for a in _num]))
+_ev = build_puzzle_line(_top, _pb, True, show_opponent=True, max_plies=8, move_numbers=False)
+check("numbers off: only the current move carries an eval",
+      [a.label for a in _ev] == ["+0.50", "", ""], str([a.label for a in _ev]))
+_won = build_puzzle_line(_top, _pb, True, show_opponent=False, max_plies=8, move_numbers=True)
+check("winning-only numbers by DISPLAYED order (opponent hidden -> 1,2)",
+      [a.label for a in _won] == ["1", "2"], str([a.label for a in _won]))
 
 print(f"\n{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)

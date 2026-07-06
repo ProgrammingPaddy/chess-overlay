@@ -505,9 +505,13 @@ class MenuWindow(QtWidgets.QWidget):
         arow.addWidget(self.puzzle_lookahead_spin)
         arow.addStretch(1)
         pf.addLayout(arow)
+        self.puzzle_numbers_cb = QtWidgets.QCheckBox("Number the moves (1, 2, 3…) instead of the eval")
+        self.puzzle_numbers_cb.setChecked(self.cfg.puzzle_move_numbers)
+        self.puzzle_numbers_cb.setToolTip(
+            "Label each solution arrow with its place in the line (1 = the move to play now) "
+            "instead of the evaluation. Moves that land on the same square share one label.")
         self.puzzle_winning_cb = QtWidgets.QCheckBox("Show only your side's moves (hide opponent replies)")
         self.puzzle_winning_cb.setChecked(self.cfg.puzzle_winning_only)
-        pf.addWidget(self.puzzle_winning_cb)
         self.puzzle_mover_cb = QtWidgets.QCheckBox("Side to move = the side on the bottom (mover's view)")
         self.puzzle_mover_cb.setChecked(self.cfg.puzzle_mover_on_bottom)
         self.puzzle_mover_cb.setToolTip(
@@ -515,7 +519,6 @@ class MenuWindow(QtWidgets.QWidget):
             "side to move. Derives the side from the (very accurate) board orientation — the "
             "strongest signal, so it takes priority over the highlight and the engine's guess. "
             "The 'Flip board orientation' and 'Whose turn' overrides still win.")
-        pf.addWidget(self.puzzle_mover_cb)
         self.puzzle_highlight_cb = QtWidgets.QCheckBox("Use last-move highlight to fix the side (all themes)")
         self.puzzle_highlight_cb.setChecked(self.cfg.puzzle_use_highlight)
         self.puzzle_highlight_cb.setToolTip(
@@ -523,7 +526,13 @@ class MenuWindow(QtWidgets.QWidget):
             "move it is with near-certainty (fixes the ~10% side misses). Self-calibrates to "
             "any theme, runs off the main thread, and NEVER touches piece recognition — if "
             "it can't read a highlight it simply abstains and the engine picks the side.")
-        pf.addWidget(self.puzzle_highlight_cb)
+        # Two columns keep the group short: side-detection on top, display below.
+        cbgrid = QtWidgets.QGridLayout()
+        cbgrid.addWidget(self.puzzle_mover_cb, 0, 0)
+        cbgrid.addWidget(self.puzzle_highlight_cb, 0, 1)
+        cbgrid.addWidget(self.puzzle_numbers_cb, 1, 0)
+        cbgrid.addWidget(self.puzzle_winning_cb, 1, 1)
+        pf.addLayout(cbgrid)
         self.puzzle_auto_btn = QtWidgets.QPushButton("Auto-pick the side to solve")
         self.puzzle_auto_btn.setToolTip(
             "Let the engine pick the side. The 'Whose turn' buttons override this "
@@ -542,10 +551,11 @@ class MenuWindow(QtWidgets.QWidget):
         for cb in (self.track_cb, self.predict_cb, self.pause_drag_cb):
             lo.addWidget(cb)
 
-        # Side-by-side groups (see _row) so the panel stays short.
+        # Side-by-side groups (see _row) so the panel stays short. Puzzle options span the
+        # full width (its checkboxes are a 2-column grid), so 'Whose turn' pairs with 'Live'.
         v.addLayout(self._row(mode, colour))
-        v.addLayout(self._row(turn, self.puzzle_group))
-        v.addWidget(live)
+        v.addLayout(self._row(turn, live))
+        v.addWidget(self.puzzle_group)
 
         self.fen_edit = QtWidgets.QLineEdit(chess.STARTING_FEN)
         v.addWidget(self.fen_edit)
@@ -622,6 +632,7 @@ class MenuWindow(QtWidgets.QWidget):
         self.puzzle_auto_btn.clicked.connect(self._on_puzzle_auto)
         self.puzzle_winning_cb.toggled.connect(self._on_puzzle_winning_toggled)
         self.puzzle_lookahead_spin.valueChanged.connect(self._on_puzzle_lookahead_changed)
+        self.puzzle_numbers_cb.toggled.connect(self._on_puzzle_numbers_toggled)
         self.puzzle_highlight_cb.toggled.connect(self._on_puzzle_highlight_toggled)
         self.puzzle_mover_cb.toggled.connect(self._on_puzzle_mover_toggled)
         self.strength_preset.currentIndexChanged.connect(self._on_strength_preset)
@@ -1097,7 +1108,9 @@ class MenuWindow(QtWidgets.QWidget):
             return
         ahead = max(0, self.cfg.puzzle_lookahead)
         max_plies = 1 + ahead                    # the move to play now + N half-moves ahead
-        self._suggestions = build_puzzle_line(top, board, hero_white, show_opp, max_plies=max_plies)
+        self._suggestions = build_puzzle_line(top, board, hero_white, show_opp,
+                                              max_plies=max_plies,
+                                              move_numbers=self.cfg.puzzle_move_numbers)
         # A lone current move can use the live off-board filter (it clears the instant the
         # piece moves); a multi-ply line can't (its later source squares aren't occupied
         # yet), so it draws unfiltered and is refreshed wholesale each move.
@@ -1521,6 +1534,13 @@ class MenuWindow(QtWidgets.QWidget):
         self.cfg.puzzle_lookahead = int(value)
         self.cfg.save()
         self._reanalyze_current()
+
+    def _on_puzzle_numbers_toggled(self, on: bool) -> None:
+        if self._loading:
+            return
+        self.cfg.puzzle_move_numbers = on
+        self.cfg.save()
+        self._reanalyze_current()          # relabel the current solution arrows
 
     def _on_puzzle_highlight_toggled(self, on: bool) -> None:
         if self._loading:

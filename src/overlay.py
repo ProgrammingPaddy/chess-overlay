@@ -234,15 +234,19 @@ LINE_MIN_STRENGTH = 0.30
 
 
 def build_puzzle_line(top, board, hero_is_white: bool, show_opponent: bool = True,
-                      max_plies: int = 8) -> list["Annotation"]:
+                      max_plies: int = 8, move_numbers: bool = False) -> list["Annotation"]:
     """Fading arrows for a WHOLE forced solution, drawn at once.
 
     ``top`` is the best line; its ``pv`` is walked from ``board`` (whose turn is the
     side to move). The hero (winning) side's moves are GREEN — the immediate one
     GOLD — and the opponent's forced replies RED; each step is fainter the deeper in
     the line it sits, so the move to play now is the most opaque. Opponent arrows are
-    dropped when ``show_opponent`` is False ('winning side only'). The eval label sits
-    on the current move only, so the deeper arrows stay uncluttered."""
+    dropped when ``show_opponent`` is False ('winning side only').
+
+    Labels: with ``move_numbers`` off, only the current move carries an eval, so the deeper
+    arrows stay uncluttered. With it on, EACH shown arrow is numbered by its position in the
+    displayed line (1 = the move to play now, 2 = next, …); moves that land on the same
+    square share one combined label ('1,3') so the numbers never overprint."""
     anns: list[Annotation] = []
     if not top or not getattr(top, "pv", None):
         return anns
@@ -250,20 +254,40 @@ def build_puzzle_line(top, board, hero_is_white: bool, show_opponent: bool = Tru
     abs_cp = -top.score_cp if (flip and top.score_cp is not None) else top.score_cp
     abs_mate = -top.mate_in if (flip and top.mate_in is not None) else top.mate_in
     walk = board.copy()
+    shown = 0
     for k, move in enumerate(top.pv[:max_plies]):
         is_hero = ((walk.turn == chess.WHITE) == hero_is_white)
         if is_hero or show_opponent:
+            shown += 1
             strength = max(LINE_MIN_STRENGTH, 1.0 - k * LINE_FADE_STEP)
+            label = str(shown) if move_numbers else (top.eval_text_pov(flip) if k == 0 else "")
             anns.append(Annotation(
                 move=move, rank=k + 1, opponent=not is_hero,
-                label=(top.eval_text_pov(flip) if k == 0 else ""),
-                score_cp=abs_cp, mate=abs_mate, strength=strength,
+                label=label, score_cp=abs_cp, mate=abs_mate, strength=strength,
                 gold=(is_hero and k == 0), player_is_white=hero_is_white))
         try:
             walk.push(move)
         except Exception:
             break
+    if move_numbers:
+        _combine_same_square_labels(anns)
     return anns
+
+
+def _combine_same_square_labels(anns: list["Annotation"]) -> None:
+    """Move-number labels sit on the destination square; when several moves land on the
+    SAME square, merge their numbers onto one arrow ('1,3') and blank the rest so the
+    labels don't overprint (kept on the earliest so its colour/side reads sensibly)."""
+    from collections import defaultdict
+    groups: dict = defaultdict(list)
+    for a in anns:
+        if a.label:
+            groups[a.move.to_square].append(a)
+    for group in groups.values():
+        if len(group) > 1:
+            group[0].label = ",".join(a.label for a in group)
+            for a in group[1:]:
+                a.label = ""
 
 
 def visible_annotations(board, annotations):
