@@ -78,6 +78,11 @@ class Config:
     # last-move square highlight to fix whose-move-it-is with certainty (off by default;
     # never touches piece recognition — a wrong/absent read simply abstains).
     puzzle_use_highlight: bool = False
+    # Mover-on-bottom: puzzle boards are shown from the side-to-move's perspective, so the
+    # BOTTOM army IS the side to move. Deriving the side from the (~99%) orientation beats
+    # the ~91% engine standout, so this is the authoritative side source for a FRESH puzzle
+    # when on (highlight/standout defer). Only the initial position — parity governs after.
+    puzzle_mover_on_bottom: bool = True
     auto_track: bool = True          # auto-track the live board (engine analysis on by default)
 
     @classmethod

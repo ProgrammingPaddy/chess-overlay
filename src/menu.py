@@ -508,6 +508,14 @@ class MenuWindow(QtWidgets.QWidget):
         self.puzzle_winning_cb = QtWidgets.QCheckBox("Show only your side's moves (hide opponent replies)")
         self.puzzle_winning_cb.setChecked(self.cfg.puzzle_winning_only)
         pf.addWidget(self.puzzle_winning_cb)
+        self.puzzle_mover_cb = QtWidgets.QCheckBox("Side to move = the side on the bottom (mover's view)")
+        self.puzzle_mover_cb.setChecked(self.cfg.puzzle_mover_on_bottom)
+        self.puzzle_mover_cb.setToolTip(
+            "Puzzles are shown from the side-to-move's perspective, so the BOTTOM army is the "
+            "side to move. Derives the side from the (very accurate) board orientation — the "
+            "strongest signal, so it takes priority over the highlight and the engine's guess. "
+            "The 'Flip board orientation' and 'Whose turn' overrides still win.")
+        pf.addWidget(self.puzzle_mover_cb)
         self.puzzle_highlight_cb = QtWidgets.QCheckBox("Use last-move highlight to fix the side (all themes)")
         self.puzzle_highlight_cb.setChecked(self.cfg.puzzle_use_highlight)
         self.puzzle_highlight_cb.setToolTip(
@@ -615,6 +623,7 @@ class MenuWindow(QtWidgets.QWidget):
         self.puzzle_winning_cb.toggled.connect(self._on_puzzle_winning_toggled)
         self.puzzle_lookahead_spin.valueChanged.connect(self._on_puzzle_lookahead_changed)
         self.puzzle_highlight_cb.toggled.connect(self._on_puzzle_highlight_toggled)
+        self.puzzle_mover_cb.toggled.connect(self._on_puzzle_mover_toggled)
         self.strength_preset.currentIndexChanged.connect(self._on_strength_preset)
         self.strength_slider.valueChanged.connect(self._on_strength_slider)
         # Engine selection + per-engine option controls.
@@ -875,6 +884,14 @@ class MenuWindow(QtWidgets.QWidget):
         self._orient_belief = (None, 0.5)     # re-evaluated on the next confident frame
         self._orient_votes = 0
         self._refresh_orientation_indicator()
+        # Mover-on-bottom: the side to move IS the bottom army, so flipping the board (manual
+        # flip or auto-orient) flips the puzzle side too — keep them consistent before the
+        # re-analysis. A manually-pinned side (the turn buttons) still wins.
+        if (self._puzzle_active() and self.cfg.puzzle_mover_on_bottom
+                and not self._puzzle_side_forced):
+            self._puzzle_side = chess.WHITE if white_bottom else chess.BLACK
+            self._puzzle_side_source = "mover-on-bottom"
+            self._refresh_turn_label()
         self._reanalyze_current()
 
     def _on_player_colour_changed(self, *_) -> None:
@@ -1485,10 +1502,8 @@ class MenuWindow(QtWidgets.QWidget):
         self._reanalyze_current()
 
     def _on_puzzle_auto(self) -> None:
-        hl = self._highlight_side()                   # prefer the highlight if it read one
-        self._puzzle_side = hl
+        self._puzzle_side, self._puzzle_side_source = self._auto_puzzle_side()
         self._puzzle_side_forced = False
-        self._puzzle_side_source = "move-highlight" if hl is not None else "engine"
         self._refresh_turn_label()
         self._reanalyze_current()
         self.status_label.setText("Puzzle — auto-picking the side.")
@@ -1512,7 +1527,21 @@ class MenuWindow(QtWidgets.QWidget):
             return
         self.cfg.puzzle_use_highlight = on
         self.cfg.save()
-        self._puzzle_anchor = None        # re-read the side (highlight or engine) for this position
+        self._rederive_puzzle_side()
+
+    def _on_puzzle_mover_toggled(self, on: bool) -> None:
+        if self._loading:
+            return
+        self.cfg.puzzle_mover_on_bottom = on
+        self.cfg.save()
+        self._rederive_puzzle_side()
+
+    def _rederive_puzzle_side(self) -> None:
+        """Re-pick the current puzzle's side from the auto source (after a side-source
+        toggle changed). A manual pin (the turn buttons) still wins; then re-analyse."""
+        if self._puzzle_active() and not self._puzzle_side_forced:
+            self._puzzle_side, self._puzzle_side_source = self._auto_puzzle_side()
+            self._refresh_turn_label()
         self._reanalyze_current()
 
     def _on_track_toggled(self, on: bool) -> None:
@@ -1615,6 +1644,19 @@ class MenuWindow(QtWidgets.QWidget):
             return h.side_to_move
         return None
 
+    def _auto_puzzle_side(self) -> tuple[bool | None, str]:
+        """The AUTO (non-forced) side to move for a fresh puzzle + its source, in priority:
+          1. mover-on-bottom — the board is shown from the mover's view, so the BOTTOM army
+             is the side to move; derived from the ~99% orientation, it beats every other
+             signal and is the authority when enabled (highlight/standout defer to it);
+          2. the last-move HIGHLIGHT (if enabled and confident);
+          3. else None -> the engine cold-picks the side during analysis.
+        Only for the INITIAL position — after a move, parity (not this) sets the side."""
+        if self.cfg.puzzle_mover_on_bottom:
+            return (chess.WHITE if self.cfg.white_bottom else chess.BLACK), "mover-on-bottom"
+        hl = self._highlight_side()
+        return (hl, "move-highlight") if hl is not None else (None, "engine")
+
     def _reconcile_puzzle(self, board: chess.Board) -> None:
         """Puzzle reconcile — anchored on PLACEMENT, with the side tracked by PARITY.
 
@@ -1651,14 +1693,12 @@ class MenuWindow(QtWidgets.QWidget):
             self._puzzle_side = None                 # re-pick the side once for the new puzzle
             self._puzzle_side_forced = False
             self._suggestions = []
-        # Side still unknown (new puzzle, or just entered puzzle mode): prefer the
-        # near-certain last-move HIGHLIGHT when enabled; else the engine cold-picks it on
-        # analysis. A played move (above) already set the side by parity, so this is
-        # skipped then — parity, being ground truth, always wins over the highlight.
+        # Side still unknown (new puzzle, or just entered puzzle mode): pick it once from
+        # the best available auto source (mover-on-bottom > highlight > engine — see
+        # _auto_puzzle_side). A played move (above) already set the side by parity, so this
+        # is skipped then — parity, being ground truth, always wins.
         if self._puzzle_side is None and not self._puzzle_side_forced:
-            hl = self._highlight_side()
-            self._puzzle_side = hl
-            self._puzzle_side_source = "move-highlight" if hl is not None else "engine"
+            self._puzzle_side, self._puzzle_side_source = self._auto_puzzle_side()
         # moves == [] : the tracker was already at this placement — only (re)establish the
         # anchor; keep any arrows on screen.
         self._puzzle_anchor = fen
