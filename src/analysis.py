@@ -46,6 +46,13 @@ class EngineController(QtCore.QThread):
         self._shutdown = False
         self._analysis = None
         self._engine: chess.engine.SimpleEngine | None = None
+        # Set when a helper catches a DEAD engine (EngineTerminatedError). The blocking /
+        # look-ahead helpers (_top_moves, _analyse_blocking) swallow errors to keep the
+        # thread alive, so without this flag a dead engine would go unnoticed on the
+        # OPPONENT path (its only caller) and the reds would stay broken for the rest of
+        # the session, while the player path silently respawns. run() respawns before the
+        # next job when this is set, so both paths recover identically.
+        self._engine_broken = False
         # Player-eval strength limiter (applied per-analysis; opponent stays full).
         self._strength = (False, 0)            # (limit, elo) requested for THIS job
         self._applied_strength: tuple | None = None   # what the engine is configured to now
@@ -113,7 +120,12 @@ class EngineController(QtCore.QThread):
                     self._safe_configure({"Threads": threads, "Hash": hash_mb})
                 if job is None:
                     continue
-                if self._engine is None and not self._spawn_engine():
+                # Respawn if the engine is absent OR a prior job caught it dead. The
+                # latter is what lets the opponent (reds) path recover from an engine
+                # death — its helpers swallow the error, so without this it would never
+                # come back (see _engine_broken).
+                if ((self._engine is None or self._engine_broken)
+                        and not self._spawn_engine()):
                     self._wake.wait(1.0)      # engine down — back off, don't busy-loop
                     continue
                 self._analyze(*job)
@@ -133,6 +145,7 @@ class EngineController(QtCore.QThread):
                                   **self._extra_options})
             self._detect_strength_support()
             self._applied_strength = None       # a fresh engine is full strength; force re-apply
+            self._engine_broken = False          # a fresh process is healthy
             return True
         except Exception as exc:
             self.failed.emit(f"engine failed to start: {exc}")
@@ -223,6 +236,13 @@ class EngineController(QtCore.QThread):
                         break
                     if info.get("pv"):
                         latest[info.get("multipv", 1)] = info
+        except chess.engine.EngineTerminatedError:
+            # The engine process died. Only the opponent/look-ahead path calls this, and
+            # it swallows the error to stay alive — so flag a respawn (unless we're just
+            # being interrupted), or the reds would never come back. See _engine_broken.
+            if not self._aborting():
+                self._engine_broken = True
+            return []
         except Exception:
             return []
         finally:
@@ -351,6 +371,10 @@ class EngineController(QtCore.QThread):
         try:
             infos = self._engine.analyse(board.copy(), chess.engine.Limit(depth=depth),
                                          multipv=n)
+        except chess.engine.EngineTerminatedError:
+            if not self._aborting():        # dead engine -> respawn next job (see _engine_broken)
+                self._engine_broken = True
+            return []
         except Exception:
             return []
         if isinstance(infos, dict):                  # may collapse to a single InfoDict

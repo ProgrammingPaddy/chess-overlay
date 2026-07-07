@@ -101,7 +101,57 @@ for s, cap in ((8, 22), (12, 12), (1, 22), (15, 30)):
           str(ladder))
 
 
-# --- 3. selection, with the real engine (skipped if Stockfish is absent) ------
+# --- 3. engine-death recovery: the opponent (reds) path must flag a respawn ---
+# _top_moves / _analyse_blocking swallow errors to keep the analysis thread alive, so a
+# DEAD engine on the opponent's turn (their ONLY callers in live play) would otherwise
+# never come back — the reds stay broken for the session — while the player path silently
+# respawns via run(). The _engine_broken flag closes that gap so both paths recover.
+class _DeadEngine:
+    options: dict = {}
+
+    def analysis(self, *a, **k):
+        raise chess.engine.EngineTerminatedError("dead")
+
+    def analyse(self, *a, **k):
+        raise chess.engine.EngineTerminatedError("dead")
+
+    def configure(self, *a, **k):
+        pass
+
+    def quit(self):
+        pass
+
+    def close(self):
+        pass
+
+
+c3 = EngineController("dummy", 1, 16)
+check("a fresh controller is not flagged broken", c3._engine_broken is False)
+
+c3._engine = _DeadEngine()
+c3._wake.clear()                                        # a genuine death, not an interruption
+out = c3._top_moves(chess.Board(), 3, 12)
+check("_top_moves on a dead engine returns [] (thread survives)", out == [], str(out))
+check("_top_moves flags the dead engine for respawn", c3._engine_broken is True)
+
+# an INTERRUPTION (a newer request set _wake) is NOT a death -> must not flag a respawn,
+# or every position change would needlessly restart the engine.
+c3._engine_broken = False
+c3._engine = _DeadEngine()
+c3._wake.set()
+c3._top_moves(chess.Board(), 3, 12)
+check("_top_moves interrupted (wake set) does NOT flag broken", c3._engine_broken is False)
+c3._wake.clear()
+
+# the blocking puzzle-pick path flags a respawn the same way
+c3._engine_broken = False
+c3._engine = _DeadEngine()
+out = c3._analyse_blocking(chess.Board(), 2, 12)
+check("_analyse_blocking on a dead engine returns []", out == [], str(out))
+check("_analyse_blocking flags the dead engine for respawn", c3._engine_broken is True)
+
+
+# --- 4. selection, with the real engine (skipped if Stockfish is absent) ------
 path = find_stockfish()
 if not path:
     print("  SKIP  no Stockfish found — selection test skipped")
@@ -160,6 +210,12 @@ else:
     legal = all(r.move in bd.legal_moves for _, resp, bd in refine for r in resp)
     check("live look-ahead responses are legal on the analysed board", legal)
     check("deep stream layered on the settled line", any(r[0] == "post-stream" for r in rounds))
+
+    # a fresh process clears the broken flag, so run() stops respawning once healthy again
+    c2._engine_broken = True
+    spawned = c2._spawn_engine()
+    check("_spawn_engine clears the broken flag once the engine is healthy",
+          spawned and c2._engine_broken is False, f"spawned={spawned}, broken={c2._engine_broken}")
     c2._engine.quit()
 
 print(f"\n{PASS} passed, {FAIL} failed")
