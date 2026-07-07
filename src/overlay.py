@@ -45,6 +45,17 @@ FAINT_ALPHA = 45           # opacity of the weakest / a clustered move (still vi
 SPREAD_FULL_CP = 7.0       # eval spread (cp) among the shown moves at which contrast is full
 GOLD_LEAD_CP = 100.0       # a non-mate move this many cp clear of the rest goes gold
 
+# Combined mode colours a move by WHICH ENGINE suggested it (not by eval), so several
+# engines' picks can be told apart at a glance. Your move is a solid arrow in the engine
+# colour; the engine's predicted OPPONENT move is the same colour but DASHED. Each engine
+# also gets a slightly larger ring so overlapping circles (when engines agree) still read.
+ENGINE_COLORS = {
+    "stockfish": (0, 200, 235),    # cyan
+    "leela": (95, 225, 120),       # green
+    "maia2": (255, 150, 205),      # light pink
+}
+ENGINE_RING_SCALE = {"stockfish": 1.0, "leela": 1.12, "maia2": 1.24}
+
 
 def _advantage(ann: "Annotation") -> float:
     """ABSOLUTE advantage in pawns (+ White better, - Black better); mate clamps large."""
@@ -106,6 +117,8 @@ def _gold_strengths(suggestions) -> dict:
 
 def _arrow_color(ann: "Annotation") -> QtGui.QColor:
     alpha = int(round(FAINT_ALPHA + (255 - FAINT_ALPHA) * max(0.0, min(1.0, ann.strength))))
+    if ann.color is not None:                 # combined mode: colour = engine identity
+        return QtGui.QColor(*ann.color, alpha)
     if ann.opponent:                          # opponent's likely moves, in red
         if ann.gold:                          # an overwhelmingly strong reply -> very dark red
             return QtGui.QColor(*DARK_RED, max(alpha, 230))
@@ -116,6 +129,9 @@ def _arrow_color(ann: "Annotation") -> QtGui.QColor:
 
 
 def _eval_text_color(ann: "Annotation") -> QtGui.QColor:
+    if ann.color is not None:                 # combined mode: tint the eval chip to the engine
+        r, g, b = ann.color
+        return QtGui.QColor(min(255, r + 45), min(255, g + 45), min(255, b + 45))
     if ann.opponent:
         return QtGui.QColor(255, 70, 70) if ann.gold else QtGui.QColor(255, 140, 140)
     if ann.gold:
@@ -155,6 +171,13 @@ class Annotation:
     strength: float = 1.0          # 0..1 relative standout among shown moves -> opacity
     gold: bool = False             # standout (>=1 pawn clear) or forced-mate move
     player_is_white: bool = True   # which colour the player is -> green/grey is player-POV
+    # Combined mode only (None/defaults everywhere else, so single-engine drawing is
+    # untouched): an explicit RGB overrides the eval-based colour with the engine's
+    # identity colour; ``dashed`` marks the engine's predicted OPPONENT move; ``ring``
+    # scales the circles so engines that agree don't fully overlap.
+    color: tuple | None = None
+    dashed: bool = False
+    ring: float = 1.0
 
 
 def _styled_set_policy(suggestions, opponent: bool, flip: bool, gold: bool,
@@ -288,6 +311,43 @@ def _combine_same_square_labels(anns: list["Annotation"]) -> None:
             group[0].label = ",".join(a.label for a in group)
             for a in group[1:]:
                 a.label = ""
+
+
+def build_combined_annotations(per_engine, opponent_turn: bool) -> list["Annotation"]:
+    """Overlay several engines' picks at once, each in its OWN colour (see ENGINE_COLORS).
+
+    ``per_engine`` is a list of ``(engine_key, suggestions, board)`` — each engine's top
+    move(s) for the side to move on ``board``. All engines analyse the SAME position, so
+    every arrow is legal on the live board. On your turn the arrows are SOLID; on the
+    opponent's turn they are DASHED — that dashed set is each engine's 'opponent eval'.
+    Lower-ranked moves within one engine fade; the eval (or human %) rides along as the
+    label, tinted to the engine's colour."""
+    anns: list[Annotation] = []
+    for key, suggestions, board in per_engine:
+        if not suggestions:
+            continue
+        col = ENGINE_COLORS.get(key)
+        ring = ENGINE_RING_SCALE.get(key, 1.0)
+        flip = board.turn != chess.WHITE          # eval label ABSOLUTE (+White, -Black)
+        strengths = _relative_strengths(suggestions)
+        pols = [float(getattr(s, "policy", None) or 0.0) for s in suggestions]
+        policy = any(getattr(s, "policy", None) is not None for s in suggestions)
+        pmax = max(pols) if pols else 0.0
+        for i, s in enumerate(suggestions):
+            abs_cp = (-s.score_cp if (flip and s.score_cp is not None) else s.score_cp)
+            abs_mate = (-s.mate_in if (flip and s.mate_in is not None) else s.mate_in)
+            if policy:
+                label = f"{pols[i] * 100:.0f}%"
+                strength = (pols[i] / pmax) if pmax > 0 else 1.0
+            else:
+                label = s.eval_text_pov(flip)
+                strength = strengths[i] if i < len(strengths) else 1.0
+            anns.append(Annotation(
+                move=s.move, rank=s.rank, label=label, opponent=False,
+                score_cp=abs_cp, mate=abs_mate, strength=strength,
+                player_is_white=(board.turn == chess.WHITE),
+                color=col, dashed=opponent_turn, ring=ring))
+    return anns
 
 
 def visible_annotations(board, annotations):
@@ -446,20 +506,24 @@ class _OverlayWindow(QtWidgets.QWidget):
         color = _arrow_color(ann)
         src = g.square_center(ann.move.from_square)
         dst = g.square_center(ann.move.to_square)
-        radius = g.square * 0.42
+        radius = g.square * 0.42 * max(0.5, ann.ring)
 
-        painter.setPen(QtGui.QPen(color, max(3.0, g.square * 0.06)))
+        pen = QtGui.QPen(color, max(3.0, g.square * 0.06))
+        if ann.dashed:                                # combined: the engine's opponent move
+            pen.setStyle(QtCore.Qt.DashLine)
+        painter.setPen(pen)
         painter.setBrush(QtCore.Qt.NoBrush)
         painter.drawEllipse(src, radius, radius)      # circle the piece
         painter.drawEllipse(dst, radius, radius)      # circle the destination
 
-        self._draw_arrow(painter, src, dst, color, g.square)
+        self._draw_arrow(painter, src, dst, color, g.square, dashed=ann.dashed)
         if ann.label:
             self._draw_label(painter, dst, ann.label, _eval_text_color(ann), g.square)
 
     @staticmethod
     def _draw_arrow(painter: QtGui.QPainter, start: QtCore.QPointF,
-                    end: QtCore.QPointF, color: QtGui.QColor, square: float) -> None:
+                    end: QtCore.QPointF, color: QtGui.QColor, square: float,
+                    dashed: bool = False) -> None:
         dx, dy = end.x() - start.x(), end.y() - start.y()
         dist = math.hypot(dx, dy)
         if dist < 1.0:
@@ -471,6 +535,8 @@ class _OverlayWindow(QtWidgets.QWidget):
 
         shaft = QtGui.QPen(color, max(3.0, square * 0.10))
         shaft.setCapStyle(QtCore.Qt.RoundCap)
+        if dashed:                     # combined: the engine's predicted opponent move
+            shaft.setStyle(QtCore.Qt.DashLine)
         painter.setPen(shaft)
         painter.drawLine(QtCore.QPointF(sx, sy), QtCore.QPointF(ex, ey))
 

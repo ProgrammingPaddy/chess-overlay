@@ -8,7 +8,7 @@ Only stable preferences live here.
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.json"
@@ -36,12 +36,23 @@ class Config:
     limit_player_strength: bool = False
     player_elo: int = 1500
     # --- engine selection (Stockfish default; Leela/Maia 2 are optional add-ons) ---
-    engine: str = "stockfish"        # "stockfish" | "leela" | "maia2"
+    engine: str = "stockfish"        # "stockfish" | "leela" | "maia2" | "combined"
     maia_player_elo: int = 1500      # Maia 2: your rating (the moves IT predicts for you)
     maia_opp_elo: int = 1500         # Maia 2: opponent rating (predicts THEIR moves)
     maia_model: str = "rapid"        # Maia 2 model: "rapid" | "blitz"
     maia_device: str = "gpu"         # Maia 2 device: "gpu" | "cpu"
     leela_network: str = ""          # Leela weights path ("" = auto-pick the strongest)
+    # --- combined mode (engine == "combined") ---
+    # Run several engines AT ONCE and overlay each one's pick in its own colour
+    # (Stockfish cyan, Leela green, Maia 2 pink). ``combined_visible`` toggles which
+    # engines run AND show — an unchecked engine is never spawned, so hiding it costs
+    # nothing (the compute lever). ``combined_lines`` is the per-engine arrow count.
+    # Everything else each child needs (network, Elo, threads) comes from the settings
+    # above, so combined mode adds nothing that alters single-engine behaviour.
+    combined_visible: dict = field(default_factory=lambda: {
+        "stockfish": True, "leela": True, "maia2": True})
+    combined_lines: dict = field(default_factory=lambda: {
+        "stockfish": 1, "leela": 1, "maia2": 3})
 
     # --- preferences (stable across sessions) ---
     board_monitor: int = 0
@@ -88,14 +99,31 @@ class Config:
     puzzle_mover_on_bottom: bool = True
     auto_track: bool = True          # auto-track the live board (engine analysis on by default)
 
+    # Combined-mode engine keys and their default visibility / arrow counts.
+    _COMBINED_DEFAULT_VISIBLE = {"stockfish": True, "leela": True, "maia2": True}
+    _COMBINED_DEFAULT_LINES = {"stockfish": 1, "leela": 1, "maia2": 3}
+
     @classmethod
     def load(cls) -> "Config":
         if CONFIG_PATH.exists():
             data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
             cls._migrate(data)
             known = {k: v for k, v in data.items() if k in cls.__dataclass_fields__}
-            return cls(**known)
-        return cls()
+            obj = cls(**known)
+        else:
+            obj = cls()
+        obj._normalize_combined()
+        return obj
+
+    def _normalize_combined(self) -> None:
+        """Fill any missing engine keys and clamp arrow counts, so a partial or older
+        saved dict (or a future new engine) always yields a complete, sane mapping."""
+        v = self.combined_visible if isinstance(self.combined_visible, dict) else {}
+        n = self.combined_lines if isinstance(self.combined_lines, dict) else {}
+        self.combined_visible = {k: bool(v.get(k, d))
+                                 for k, d in self._COMBINED_DEFAULT_VISIBLE.items()}
+        self.combined_lines = {k: max(1, min(5, int(n.get(k, d))))
+                               for k, d in self._COMBINED_DEFAULT_LINES.items()}
 
     @staticmethod
     def _migrate(data: dict) -> None:

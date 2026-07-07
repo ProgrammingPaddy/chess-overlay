@@ -15,15 +15,17 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from src.analysis import EngineController
 from src.calibrate import auto_calibrate, calibrate
-from src.engine_profiles import PROFILES, make_controller
+from src.engine_profiles import (COMBINED_ENGINES, PROFILES, availability,
+                                 make_controller)
 from src.capture import ScreenCapture, save_image
 from src.config import Config
 from src.consensus import ConsensusBuffer
 from src.engine import find_stockfish
 from src.openings import identify as identify_opening
 from src.orientation import detect_orientation
-from src.overlay import (Annotation, BoardGeometry, OverlayManager,
-                         build_annotations, build_puzzle_line, visible_annotations)
+from src.overlay import (Annotation, BoardGeometry, ENGINE_COLORS, OverlayManager,
+                         build_annotations, build_combined_annotations,
+                         build_puzzle_line, visible_annotations)
 from src import themes
 from src.tracker import GameTracker
 from src.vision import VisionModel, certainty, dump_calibration, dump_recognition
@@ -145,6 +147,7 @@ class MenuWindow(QtWidgets.QWidget):
         self._puzzle_side_source = "auto"            # where the side came from (status text)
         self._puzzle_anchor: str | None = None       # placement the current puzzle side applies to
         self._last_highlight = None                  # latest move-highlight read (VisionWorker)
+        self._combined_state: dict = {}              # combined mode: engine_key -> (suggestions, board)
         self._filter_arrows = True                   # hide arrows off the live board (off for solution lines)
         self._orient_belief: tuple = (None, 0.5)     # (CV agrees with active orientation? , confidence)
         self._orient_votes = 0                       # consecutive confident-disagree frames
@@ -315,6 +318,7 @@ class MenuWindow(QtWidgets.QWidget):
         slf.addRow("Mode", self.mode_combo)
         self.lines_spin = self._spin(1, 5, self.cfg.multipv)
         slf.addRow("Lines", self.lines_spin)
+        self._engine_form = slf         # so the Lines row can be hidden per engine profile
         self.engine_status = QtWidgets.QLabel("Engine: starting…")
         self.engine_status.setWordWrap(True)
         slf.addRow(self.engine_status)
@@ -423,6 +427,44 @@ class MenuWindow(QtWidgets.QWidget):
         # Strength / Leela / Maia are mutually exclusive (see _apply_engine_profile hides
         # the inactive ones), so stacking them costs no height — only the active one shows.
         v.addWidget(self.maia_group)
+
+        # --- Combined: which engines to overlay, and how many arrows each ---
+        self.combined_group = QtWidgets.QGroupBox("Combined engines — overlay several at once")
+        cg = QtWidgets.QGridLayout(self.combined_group)
+        self.combined_visible_cbs: dict = {}
+        self.combined_lines_spins: dict = {}
+        for row, key in enumerate(COMBINED_ENGINES):
+            ok, reason = availability(key)
+            col = ENGINE_COLORS.get(key, (200, 200, 200))
+            swatch = QtWidgets.QLabel()
+            swatch.setFixedSize(14, 14)
+            swatch.setStyleSheet(f"background: rgb{tuple(col)}; border-radius: 3px;")
+            cb = QtWidgets.QCheckBox(PROFILES[key].label.split(" (")[0])
+            cb.setChecked(bool(self.cfg.combined_visible.get(key)) and ok)
+            cb.setEnabled(ok)
+            spin = QtWidgets.QSpinBox()
+            spin.setRange(1, 5)
+            spin.setValue(int(self.cfg.combined_lines.get(key, 1)))
+            spin.setEnabled(ok)
+            spin.setToolTip(reason if not ok else f"How many of {cb.text()}'s top moves to draw.")
+            cb.setToolTip(reason if not ok else "Show this engine's pick in the overlay.")
+            cb.toggled.connect(lambda on, k=key: self._on_combined_visible_toggled(k, on))
+            spin.valueChanged.connect(lambda val, k=key: self._on_combined_lines_changed(k, val))
+            cg.addWidget(swatch, row, 0)
+            cg.addWidget(cb, row, 1)
+            cg.addWidget(QtWidgets.QLabel("arrows"), row, 2)
+            cg.addWidget(spin, row, 3)
+            self.combined_visible_cbs[key] = cb
+            self.combined_lines_spins[key] = spin
+        cg.setColumnStretch(1, 1)
+        c_note = QtWidgets.QLabel(
+            "Runs the ticked engines together — each draws its best move(s) in its colour "
+            "(solid = your move, dashed = its prediction on the opponent's turn). Unticked "
+            "engines don't run, so hiding one frees its compute. Each engine keeps its own "
+            "network / Elo / threads from above.")
+        c_note.setWordWrap(True)
+        cg.addWidget(c_note, len(COMBINED_ENGINES), 0, 1, 4)
+        v.addWidget(self.combined_group)
 
         v.addStretch(1)
         return w
@@ -688,9 +730,13 @@ class MenuWindow(QtWidgets.QWidget):
         if ctrl is None:
             self.engine_status.setText(f"{label}: {err}")
             return
-        ctrl.updated.connect(self._on_analysis_updated)
+        if hasattr(ctrl, "combined_updated"):     # the combined controller relays per engine
+            ctrl.combined_updated.connect(self._on_combined_updated)
+        else:
+            ctrl.updated.connect(self._on_analysis_updated)
         ctrl.failed.connect(self._on_analysis_failed)
         ctrl.ready.connect(lambda lbl=label: self.engine_status.setText(f"{lbl}: ready."))
+        self._combined_state = {}                 # start each engine's arrows fresh
         ctrl.start()
         self._controller = ctrl
         self._eng_sig = (self.cfg.engine_threads, self.cfg.engine_hash_mb)
@@ -705,6 +751,14 @@ class MenuWindow(QtWidgets.QWidget):
         self.strength_group.setVisible("strength_elo" in f)
         self.leela_group.setVisible("leela_network" in f)
         self.maia_group.setVisible("player_elo" in f)
+        self.combined_group.setVisible("combined" in f)
+        # The global 'Lines' (multipv) is per-engine in combined mode, so hide the shared
+        # one there (combined's profile omits the 'multipv' feature).
+        lines_used = "multipv" in f
+        self.lines_spin.setVisible(lines_used)
+        lbl = self._engine_form.labelForField(self.lines_spin)
+        if lbl is not None:
+            lbl.setVisible(lines_used)
         self._sync_mode_combo()
 
     def _sync_mode_combo(self) -> None:
@@ -717,6 +771,11 @@ class MenuWindow(QtWidgets.QWidget):
         if self.cfg.engine == "maia2":
             self.mode_combo.addItem("Standard (one pass)", "live")
             self.mode_combo.addItem("Predictive (a reply to each likely move)", "predictive")
+        elif self.cfg.engine == "combined":
+            # Combined compares each engine's move for the current position — the searchers
+            # refine (Live) or run to depth (Fixed); look-ahead/predictive don't apply here.
+            self.mode_combo.addItem("Live (instant, refines)", "live")
+            self.mode_combo.addItem("Fixed depth (strong)", "fixed")
         else:
             self.mode_combo.addItem("Live (instant, refines)", "live")
             self.mode_combo.addItem("Fixed depth (strong)", "fixed")
@@ -792,6 +851,31 @@ class MenuWindow(QtWidgets.QWidget):
         self._sync_maia_controls()          # writes the snapped value back + refreshes the band
         self.cfg.save()
         self._reanalyze_current()               # Elos are per-request; no rebuild needed
+
+    def _on_combined_visible_toggled(self, key: str, on: bool) -> None:
+        """Tick/untick an engine in combined mode: spawn or tear down just that child, and
+        refresh. Off frees the engine's compute; on (re)starts it and re-analyses."""
+        if self._loading:
+            return
+        self.cfg.combined_visible[key] = bool(on)
+        self.cfg.save()
+        if self.cfg.engine != "combined":
+            return                                   # takes effect next time combined is active
+        if self._controller is not None and hasattr(self._controller, "set_visible"):
+            self._controller.set_visible(key, bool(on))
+        if not on:
+            self._combined_state.pop(key, None)      # drop its arrows at once
+        self._render_combined()
+        if on:
+            self._reanalyze_current()                # feed the just-spawned engine the position
+
+    def _on_combined_lines_changed(self, key: str, val: int) -> None:
+        if self._loading:
+            return
+        self.cfg.combined_lines[key] = max(1, min(5, int(val)))
+        self.cfg.save()
+        if self.cfg.engine == "combined":
+            self._reanalyze_current()                # per-engine arrow count is per-request
 
     def _start_analysis(self, board: chess.Board) -> None:
         puzzle = self._puzzle_active()                       # eval engines only
@@ -1058,6 +1142,60 @@ class MenuWindow(QtWidgets.QWidget):
                 self.status_label.setText(f"{head}.{note}")
         except Exception as exc:
             self.status_label.setText(f"render error: {exc}")
+
+    # ------------------------------------------------ combined (multi-engine) mode
+    _ENGINE_TAG = {"stockfish": "SF", "leela": "LC0", "maia2": "Maia"}
+
+    def _on_combined_updated(self, engine_key: str, suggestions: list, depth: int,
+                             board: chess.Board, opp_suggestions: list, token: int) -> None:
+        """One engine reported its picks for the current position (combined mode). Cache
+        them per engine and redraw the union of all visible engines' arrows."""
+        if token != self._req_id:
+            return
+        try:
+            self._combined_state[engine_key] = (suggestions, board)
+            self._render_combined()
+        except Exception as exc:
+            self.status_label.setText(f"combined render error: {exc}")
+
+    def _render_combined(self) -> None:
+        """Merge every visible engine's cached picks into engine-coloured arrows (solid on
+        your turn, dashed on the opponent's) and refresh the overlay + results list."""
+        per_engine, results, opp_turn = [], [], False
+        for key in COMBINED_ENGINES:
+            if not self.cfg.combined_visible.get(key):
+                continue
+            state = self._combined_state.get(key)
+            if not state:
+                continue
+            sugg, eboard = state
+            if eboard is not None:
+                opp_turn = eboard.turn != self._player_color()   # all engines share the position
+            per_engine.append((key, sugg, eboard))
+            if sugg:
+                results.append((key, sugg[0], eboard))
+        self._suggestions = build_combined_annotations(per_engine, opp_turn)
+        self._filter_arrows = True
+        self._draw_arrows()
+        self._fill_combined_results(results, opp_turn)
+
+    def _fill_combined_results(self, results: list, opp_turn: bool) -> None:
+        self.results_list.clear()
+        for key, s, eboard in results:
+            try:
+                san = eboard.san(s.move)
+            except Exception:
+                san = s.uci
+            flip = (eboard is not None and eboard.turn != chess.WHITE)
+            val = f"{(s.policy or 0.0) * 100:.0f}%" if s.policy is not None else s.eval_text_pov(flip)
+            self.results_list.addItem(f"{self._ENGINE_TAG.get(key, key):5s} {san:7s} {val}")
+        active = [k for k in COMBINED_ENGINES if self.cfg.combined_visible.get(k)]
+        if not active:
+            self.status_label.setText("Combined — no engines ticked (choose at least one).")
+        else:
+            who = "opponent (dashed)" if opp_turn else "you"
+            self.status_label.setText(
+                f"Combined — {len(results)}/{len(active)} engine(s) reporting; move for {who}.")
 
     @staticmethod
     def _stm_winning(top) -> bool:
@@ -1452,6 +1590,7 @@ class MenuWindow(QtWidgets.QWidget):
         self._puzzle_side_source = "auto"
         self._puzzle_anchor = None
         self._last_highlight = None
+        self._combined_state = {}       # drop stale per-engine combined arrows
         self._orient_locked_key = None  # ...and re-enables one auto-orient on it
 
     def _update_certainty(self, conf: float) -> None:
@@ -1652,8 +1791,10 @@ class MenuWindow(QtWidgets.QWidget):
         self._after_commit()
 
     def _puzzle_active(self) -> bool:
-        """Puzzle mode AND an eval engine (Maia plays normally even in puzzle mode)."""
-        return self.cfg.play_mode == "puzzle" and not self._is_policy_engine()
+        """Puzzle mode AND a single eval engine. Maia plays normally even in puzzle mode,
+        and Combined is a live-play comparison view — both fall through to the live path."""
+        return (self.cfg.play_mode == "puzzle" and not self._is_policy_engine()
+                and self.cfg.engine != "combined")
 
     def _highlight_side(self) -> bool | None:
         """The side to move read from the last-move highlight, if enabled and confident —

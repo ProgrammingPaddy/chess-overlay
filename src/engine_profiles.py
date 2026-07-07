@@ -44,9 +44,17 @@ PROFILES: dict[str, EngineProfile] = {
         frozenset({"mode", "multipv", "player_elo", "opp_elo", "maia_model"}),
         "Predicts the move a human would play — opponent-aware, banded Elo ~600–2600, a "
         "single forward pass (no search; shows candidate moves, not a deep line)."),
+    "combined": EngineProfile(
+        "combined", "Combined (compare engines)", "eval",
+        frozenset({"mode", "combined"}),
+        "Runs several engines at once and overlays each one's best move in its own colour "
+        "(Stockfish cyan, Leela green, Maia 2 pink). Toggle which you see — an unchecked "
+        "engine isn't run. On the opponent's turn each engine's prediction shows dashed."),
 }
 
-ENGINE_ORDER = ["stockfish", "leela", "maia2"]
+ENGINE_ORDER = ["stockfish", "leela", "maia2", "combined"]
+# The engines the combined view can layer (order = draw / list order). Not "combined" itself.
+COMBINED_ENGINES = ["stockfish", "leela", "maia2"]
 
 
 def availability(key: str) -> tuple[bool, str]:
@@ -63,6 +71,10 @@ def availability(key: str) -> tuple[bool, str]:
         if find_maia2_python() is None:
             return (False, "Maia 2 env not set up — run setup/provision_maia2.sh.")
         return (True, "")
+    if key == "combined":
+        if any(availability(k)[0] for k in COMBINED_ENGINES):
+            return (True, "")
+        return (False, "No engines installed for combined mode.")
     return (False, "Unknown engine.")
 
 
@@ -82,10 +94,10 @@ def leela_networks() -> list[tuple[str, str]]:
     return out
 
 
-def make_controller(cfg):
-    """Build the controller for the configured engine. Returns (controller, error).
-    All controllers share the EngineController signal/request interface."""
-    key = cfg.engine
+def build_single(key, cfg):
+    """Build ONE engine's controller. Used both for a single-engine selection and, per
+    child, by the combined controller — so the two paths build identical engines.
+    Returns (controller, error); all controllers share the EngineController interface."""
     ok, reason = availability(key)
     if not ok:
         return None, reason
@@ -101,3 +113,15 @@ def make_controller(cfg):
         return EngineController(path, cfg.engine_threads, cfg.engine_hash_mb), ""
     except Exception as exc:
         return None, f"{key} failed to start: {exc}"
+
+
+def make_controller(cfg):
+    """Build the controller for the configured engine. Returns (controller, error).
+    'combined' fans out to one child per visible engine; the rest build a single engine."""
+    if cfg.engine == "combined":
+        ok, reason = availability("combined")
+        if not ok:
+            return None, reason
+        from src.multi_engine import MultiController      # lazy: avoids an import cycle
+        return MultiController(cfg), ""
+    return build_single(cfg.engine, cfg)

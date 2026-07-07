@@ -178,7 +178,8 @@ from src.config import Config
 from src.engine_profiles import ENGINE_ORDER, PROFILES, availability, make_controller
 from src.maia2_engine import Maia2Controller as _Maia2
 
-check("three engines registered", set(ENGINE_ORDER) == {"stockfish", "leela", "maia2"})
+check("engines registered (three + combined)",
+      set(ENGINE_ORDER) == {"stockfish", "leela", "maia2", "combined"})
 check("stockfish/leela display eval, maia2 displays policy",
       PROFILES["stockfish"].display == "eval" and PROFILES["leela"].display == "eval"
       and PROFILES["maia2"].display == "policy")
@@ -200,6 +201,14 @@ if availability("maia2")[0]:
     cfg.engine = "maia2"
     ctrl, _ = make_controller(cfg)
     check("factory builds Maia 2 as the Maia controller", isinstance(ctrl, _Maia2))
+
+# combined builds the multi-engine controller (no children spawned until start())
+from src.multi_engine import MultiController as _Multi
+cfg.engine = "combined"
+ctrl, _ = make_controller(cfg)
+check("factory builds Combined as the multi-engine controller", isinstance(ctrl, _Multi))
+check("combined controller has the shared request/shutdown interface",
+      hasattr(ctrl, "request") and hasattr(ctrl, "shutdown") and hasattr(ctrl, "combined_updated"))
 
 print(f"\n{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)
