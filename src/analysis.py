@@ -65,14 +65,17 @@ class EngineController(QtCore.QThread):
                 opp_live: bool = False, opp_depth: int = 12, opp_max: int = 22,
                 limit_strength: bool = False, player_elo: int = 1500,
                 opp_elo: int = 1500, puzzle: bool = False,
-                puzzle_side: bool | None = None) -> None:
+                puzzle_side: bool | None = None,
+                root_moves: list | None = None) -> None:
         # opp_elo is part of the shared engine interface (used by the Maia 2
         # controller); the search engines ignore it. puzzle_side (None = auto-pick the
         # decisive side; True/False = solve for White/Black) only applies when puzzle.
+        # root_moves (combined 'check' path): eval EXACTLY these moves and emit — no
+        # look-ahead. None => normal analysis, so every existing caller is unaffected.
         with self._lock:
             self._pending = (board.copy(), multipv, mode, depth, player_color, token,
                              opp_live, opp_depth, opp_max, limit_strength, player_elo,
-                             puzzle, puzzle_side)
+                             puzzle, puzzle_side, root_moves)
         self._interrupt()
 
     def clear(self) -> None:
@@ -268,7 +271,8 @@ class EngineController(QtCore.QThread):
                  player_color: bool | None = None, token: int = 0,
                  opp_live: bool = False, opp_depth: int = 12, opp_max: int = 22,
                  limit_strength: bool = False, player_elo: int = 1500,
-                 puzzle: bool = False, puzzle_side: bool | None = None) -> None:
+                 puzzle: bool = False, puzzle_side: bool | None = None,
+                 root_moves: list | None = None) -> None:
         # Tempo model:
         #   * player to move  -> analyse the CURRENT position for the player.
         #   * opponent to move -> look ahead (see _analyze_opponent_turn): the
@@ -279,6 +283,12 @@ class EngineController(QtCore.QThread):
         # The player's eval can be strength-limited (simulated Elo); the opponent
         # prediction always stays full strength. Applied per-analysis below.
         self._strength = (bool(limit_strength), int(player_elo))
+        # Targeted eval (combined 'check' path): score EXACTLY these moves, full strength,
+        # and emit — no look-ahead, no tempo model. This is how a strong engine grades the
+        # Maia moves without disturbing anything else.
+        if root_moves:
+            self._eval_root_moves(board, root_moves, depth, token)
+            return
         if puzzle:
             self._analyze_puzzle(board, multipv, depth, token, puzzle_side)
             return
@@ -359,18 +369,22 @@ class EngineController(QtCore.QThread):
             return chess.WHITE
         return chess.WHITE if self._standout(white_sugg) >= self._standout(black_sugg) else chess.BLACK
 
-    def _analyse_blocking(self, board: chess.Board, multipv: int, depth: int) -> list:
+    def _analyse_blocking(self, board: chess.Board, multipv: int, depth: int,
+                          root_moves: list | None = None) -> list:
         """Ranked MoveSuggestions via a BLOCKING ``engine.analyse`` (runs to ``depth``
         and returns). Unlike the streaming ``_top_moves``, python-chess consumes the
         whole analysis internally and tears it down cleanly — there is no half-drained
         streaming analysis left for its background parser thread to keep working on.
         Puzzle mode uses this: its rapid both-sides + refine cycling, abruptly
         interrupted as you flick through puzzles, corrupted python-chess's async parser
-        and segfaulted. Hands the engine a private board copy (see _top_moves)."""
+        and segfaulted. ``root_moves`` restricts the search to exactly those moves (the
+        'check Maia lines' path). Hands the engine a private board copy (see _top_moves)."""
         n = max(1, min(multipv, board.legal_moves.count()))
         try:
-            infos = self._engine.analyse(board.copy(), chess.engine.Limit(depth=depth),
-                                         multipv=n)
+            kw = {"multipv": n}
+            if root_moves is not None:
+                kw["root_moves"] = root_moves
+            infos = self._engine.analyse(board.copy(), chess.engine.Limit(depth=depth), **kw)
         except chess.engine.EngineTerminatedError:
             if not self._aborting():        # dead engine -> respawn next job (see _engine_broken)
                 self._engine_broken = True
@@ -385,6 +399,18 @@ class EngineController(QtCore.QThread):
             if s:
                 out.append(s)
         return out
+
+    def _eval_root_moves(self, board: chess.Board, root_moves: list, depth: int,
+                         token: int) -> None:
+        """Score EXACTLY ``root_moves`` at full strength and emit them — the combined
+        'check Maia lines' path. Illegal/unscored moves are dropped."""
+        self._strength_full()
+        legal = [m for m in root_moves if m in board.legal_moves]
+        if not legal:
+            self._emit_update([], 0, board, [], token)
+            return
+        sugg = self._analyse_blocking(board, len(legal), depth, root_moves=legal)
+        self._emit_update(sugg, depth, board, [], token)
 
     def _analyze_puzzle(self, board: chess.Board, multipv: int, depth: int, token: int,
                         forced_side: bool | None = None) -> None:

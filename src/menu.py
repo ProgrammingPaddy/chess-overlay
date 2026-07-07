@@ -148,6 +148,7 @@ class MenuWindow(QtWidgets.QWidget):
         self._puzzle_anchor: str | None = None       # placement the current puzzle side applies to
         self._last_highlight = None                  # latest move-highlight read (VisionWorker)
         self._combined_state: dict = {}              # combined mode: engine_key -> (suggestions, board)
+        self._combined_check: dict = {}              # combined 'check': checker_engine -> {move_uci: eval}
         self._filter_arrows = True                   # hide arrows off the live board (off for solution lines)
         self._orient_belief: tuple = (None, 0.5)     # (CV agrees with active orientation? , confidence)
         self._orient_votes = 0                       # consecutive confident-disagree frames
@@ -457,13 +458,44 @@ class MenuWindow(QtWidgets.QWidget):
             self.combined_visible_cbs[key] = cb
             self.combined_lines_spins[key] = spin
         cg.setColumnStretch(1, 1)
+        base = len(COMBINED_ENGINES)
+        # Merge per-engine values that share a square into one compact chip.
+        self.combined_merge_cb = QtWidgets.QCheckBox("Merge evals on shared squares (one chip)")
+        self.combined_merge_cb.setChecked(self.cfg.combined_merge_labels)
+        self.combined_merge_cb.setToolTip(
+            "When engines agree on a square, show all their values (incl. Maia's %) in one "
+            "compact colour-coded chip instead of overlapping.")
+        self.combined_merge_cb.toggled.connect(self._on_combined_merge_toggled)
+        cg.addWidget(self.combined_merge_cb, base, 0, 1, 4)
+        # Grade each Maia move with a strong engine (separate instances).
+        self.combined_check_cb = QtWidgets.QCheckBox("Check Maia moves with:")
+        self.combined_check_cb.setChecked(self.cfg.combined_check_maia)
+        self.combined_check_cb.setToolTip(
+            "Add a strong-engine eval to each Maia move (extra segment on its arrow). Runs on "
+            "separate instances, so it never disturbs the engines' own best-move evals.")
+        self.combined_check_cb.toggled.connect(self._on_combined_check_toggled)
+        cg.addWidget(self.combined_check_cb, base + 1, 0, 1, 2)
+        self.combined_check_with_cbs: dict = {}
+        checkrow = QtWidgets.QHBoxLayout()
+        for eng in ("stockfish", "leela"):
+            ok = availability(eng)[0]
+            cbw = QtWidgets.QCheckBox(PROFILES[eng].label.split(" (")[0])
+            cbw.setChecked(bool(self.cfg.combined_check_with.get(eng)) and ok)
+            cbw.setEnabled(ok and self.cfg.combined_check_maia)
+            cbw.setToolTip(availability(eng)[1] if not ok
+                           else f"Use {cbw.text()} to grade the Maia moves.")
+            cbw.toggled.connect(lambda on, e=eng: self._on_combined_check_with_toggled(e, on))
+            checkrow.addWidget(cbw)
+            self.combined_check_with_cbs[eng] = cbw
+        checkrow.addStretch(1)
+        cg.addLayout(checkrow, base + 1, 2, 1, 2)
         c_note = QtWidgets.QLabel(
             "Runs the ticked engines together — each draws its best move(s) in its colour "
-            "(solid = your move, dashed = its prediction on the opponent's turn). Unticked "
-            "engines don't run, so hiding one frees its compute. Each engine keeps its own "
-            "network / Elo / threads from above.")
+            "(solid = your move, dashed = its prediction on the opponent's turn; a losing move "
+            "is red). Unticked engines don't run, so hiding one frees its compute. Each engine "
+            "keeps its own network / Elo / threads from above.")
         c_note.setWordWrap(True)
-        cg.addWidget(c_note, len(COMBINED_ENGINES), 0, 1, 4)
+        cg.addWidget(c_note, base + 2, 0, 1, 4)
         v.addWidget(self.combined_group)
 
         v.addStretch(1)
@@ -732,11 +764,13 @@ class MenuWindow(QtWidgets.QWidget):
             return
         if hasattr(ctrl, "combined_updated"):     # the combined controller relays per engine
             ctrl.combined_updated.connect(self._on_combined_updated)
+            ctrl.check_updated.connect(self._on_check_updated)
         else:
             ctrl.updated.connect(self._on_analysis_updated)
         ctrl.failed.connect(self._on_analysis_failed)
         ctrl.ready.connect(lambda lbl=label: self.engine_status.setText(f"{lbl}: ready."))
         self._combined_state = {}                 # start each engine's arrows fresh
+        self._combined_check = {}
         ctrl.start()
         self._controller = ctrl
         self._eng_sig = (self.cfg.engine_threads, self.cfg.engine_hash_mb)
@@ -877,6 +911,46 @@ class MenuWindow(QtWidgets.QWidget):
         if self.cfg.engine == "combined":
             self._reanalyze_current()                # per-engine arrow count is per-request
 
+    def _on_combined_merge_toggled(self, on: bool) -> None:
+        if self._loading:
+            return
+        self.cfg.combined_merge_labels = bool(on)
+        self.cfg.save()
+        if self.cfg.engine == "combined":
+            self._render_combined()                  # pure re-layout; no re-analysis
+
+    def _on_combined_check_toggled(self, on: bool) -> None:
+        if self._loading:
+            return
+        self.cfg.combined_check_maia = bool(on)
+        self.cfg.save()
+        for eng, cbw in self.combined_check_with_cbs.items():
+            cbw.setEnabled(availability(eng)[0] and on)
+        if self.cfg.engine != "combined":
+            return
+        if self._controller is not None and hasattr(self._controller, "refresh_checkers"):
+            self._controller.refresh_checkers()
+        if on:
+            self._reanalyze_current()                # trigger a fresh Maia result -> checks
+        else:
+            self._combined_check = {}
+            self._render_combined()
+
+    def _on_combined_check_with_toggled(self, key: str, on: bool) -> None:
+        if self._loading:
+            return
+        self.cfg.combined_check_with[key] = bool(on)
+        self.cfg.save()
+        if self.cfg.engine != "combined":
+            return
+        if self._controller is not None and hasattr(self._controller, "refresh_checkers"):
+            self._controller.refresh_checkers()
+        if on:
+            self._reanalyze_current()
+        else:
+            self._combined_check.pop(key, None)      # drop that engine's check segments
+            self._render_combined()
+
     def _start_analysis(self, board: chess.Board) -> None:
         puzzle = self._puzzle_active()                       # eval engines only
         # Puzzle mode picks the side itself (it analyses each colour), so the
@@ -901,6 +975,8 @@ class MenuWindow(QtWidgets.QWidget):
         # so tracker-turn noise can't retrigger; live keys on placement + turn.
         self._analyzing_key = self._puzzle_key(board) if puzzle else self._pos_key(board)
         self._req_id += 1
+        if self.cfg.engine == "combined":
+            self._combined_check = {}       # new position/re-analyse -> old check evals are stale
         # Strength inputs differ per engine: Stockfish uses the simulated-Elo limiter
         # on player_elo; Maia 2 uses your/opponent rating (no limiter). Leela ignores
         # both. All go through the one request() interface.
@@ -1158,6 +1234,20 @@ class MenuWindow(QtWidgets.QWidget):
         except Exception as exc:
             self.status_label.setText(f"combined render error: {exc}")
 
+    def _on_check_updated(self, engine_key: str, suggestions: list, board: chess.Board,
+                          token: int) -> None:
+        """A checker (Stockfish/Leela) graded the current Maia moves — cache its per-move
+        evals (absolute) and redraw so they ride along on the Maia arrows."""
+        if token != self._req_id:
+            return
+        try:
+            flip = (board is not None and board.turn != chess.WHITE)
+            self._combined_check[engine_key] = {s.move.uci(): s.eval_text_pov(flip)
+                                                for s in suggestions}
+            self._render_combined()
+        except Exception as exc:
+            self.status_label.setText(f"combined check error: {exc}")
+
     def _render_combined(self) -> None:
         """Merge every visible engine's cached picks into engine-coloured arrows (solid on
         your turn, dashed on the opponent's) and refresh the overlay + results list."""
@@ -1174,7 +1264,14 @@ class MenuWindow(QtWidgets.QWidget):
             per_engine.append((key, sugg, eboard))
             if sugg:
                 results.append((key, sugg[0], eboard))
-        self._suggestions = build_combined_annotations(per_engine, opp_turn)
+        # Fold the checker evals into {move_uci: [(engine, text), …]} (SF before Leela).
+        check_evals: dict = {}
+        for eng in ("stockfish", "leela"):
+            for uci, text in self._combined_check.get(eng, {}).items():
+                check_evals.setdefault(uci, []).append((eng, text))
+        self._suggestions = build_combined_annotations(
+            per_engine, opp_turn, merge_labels=self.cfg.combined_merge_labels,
+            check_evals=check_evals)
         self._filter_arrows = True
         self._draw_arrows()
         self._fill_combined_results(results, opp_turn)
@@ -1591,6 +1688,7 @@ class MenuWindow(QtWidgets.QWidget):
         self._puzzle_anchor = None
         self._last_highlight = None
         self._combined_state = {}       # drop stale per-engine combined arrows
+        self._combined_check = {}       # ...and stale check evals
         self._orient_locked_key = None  # ...and re-enables one auto-orient on it
 
     def _update_certainty(self, conf: float) -> None:

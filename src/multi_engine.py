@@ -30,19 +30,26 @@ from src.engine_profiles import COMBINED_ENGINES, availability, build_single
 class MultiController(QtCore.QObject):
     # (engine_key, player suggestions, depth, analysed Board, opponent suggestions, token)
     combined_updated = QtCore.Signal(str, list, int, object, object, int)
+    # (checker_engine_key, evals of the Maia moves, analysed Board, token) — 'check Maia lines'
+    check_updated = QtCore.Signal(str, list, object, int)
     failed = QtCore.Signal(str)
     ready = QtCore.Signal()
+
+    CHECKERS = ["stockfish", "leela"]          # engines that can grade the Maia moves
 
     def __init__(self, cfg, parent=None):
         super().__init__(parent)
         self._cfg = cfg
         self._children: dict[str, object] = {}
+        self._checkers: dict[str, object] = {}   # separate instances that eval the Maia moves
         self._ready_emitted = False
 
     # ----- lifecycle (mirrors a QThread controller's start/shutdown) -----
     def start(self) -> None:
         for key in self._active_keys():
             self._spawn(key)
+        for key in self._active_check_keys():
+            self._spawn_checker(key)
         if not self._children:                 # nothing to run — settle the UI anyway
             self._child_ready()
 
@@ -50,19 +57,66 @@ class MultiController(QtCore.QObject):
         return [k for k in COMBINED_ENGINES
                 if self._cfg.combined_visible.get(k) and availability(k)[0]]
 
+    def _active_check_keys(self) -> list[str]:
+        # Checking only makes sense when Maia is on screen (its moves are what we grade).
+        if not (self._cfg.combined_check_maia and self._cfg.combined_visible.get("maia2")):
+            return []
+        return [k for k in self.CHECKERS
+                if self._cfg.combined_check_with.get(k) and availability(k)[0]]
+
     def _spawn(self, key: str) -> None:
         ctrl, err = build_single(key, self._cfg)
         if ctrl is None:
             self.failed.emit(f"{key}: {err}")
             return
-        # Re-tag each child's result with its engine key, then relay. (The lambda runs in
-        # the child's thread; combined_updated then queues to the GUI-thread menu slot.)
-        ctrl.updated.connect(
-            lambda s, d, b, o, t, k=key: self.combined_updated.emit(k, s, d, b, o, t))
+        # Re-tag each child's result with its engine key, then relay. Maia's result also
+        # triggers the checkers. (The lambda runs in the child's thread; the signal then
+        # queues to the GUI-thread menu slot.)
+        if key == "maia2":
+            ctrl.updated.connect(self._on_maia_updated)
+        else:
+            ctrl.updated.connect(
+                lambda s, d, b, o, t, k=key: self.combined_updated.emit(k, s, d, b, o, t))
         ctrl.failed.connect(lambda m, k=key: self.failed.emit(f"{k}: {m}"))
         ctrl.ready.connect(self._child_ready)
         ctrl.start()
         self._children[key] = ctrl
+
+    def _spawn_checker(self, key: str) -> None:
+        ctrl, err = build_single(key, self._cfg)
+        if ctrl is None:
+            self.failed.emit(f"{key} (check): {err}")
+            return
+        ctrl.updated.connect(lambda s, d, b, o, t, k=key: self.check_updated.emit(k, s, b, t))
+        ctrl.failed.connect(lambda m, k=key: self.failed.emit(f"{k} (check): {m}"))
+        ctrl.start()
+        self._checkers[key] = ctrl
+
+    def _on_maia_updated(self, suggestions, depth, board, opp, token) -> None:
+        """Relay Maia's picks, then have each checker grade EXACTLY those moves (root_moves)
+        on the same position — so the strong-engine evals land on the Maia arrows."""
+        self.combined_updated.emit("maia2", suggestions, depth, board, opp, token)
+        if self._checkers and suggestions and board is not None:
+            moves = [s.move for s in suggestions]
+            depth = int(getattr(self._cfg, "engine_depth", 18))
+            for c in self._checkers.values():
+                c.request(board, len(moves), "fixed", depth, None, token, root_moves=moves)
+
+    def refresh_checkers(self) -> None:
+        """Spawn/kill checker instances to match the current check settings (toggle,
+        engine choice, or Maia visibility changed)."""
+        want = set(self._active_check_keys())
+        for key in list(self._checkers):
+            if key not in want:
+                ctrl = self._checkers.pop(key)
+                try:
+                    ctrl.clear()
+                    ctrl.shutdown()
+                except Exception:
+                    pass
+        for key in want:
+            if key not in self._checkers:
+                self._spawn_checker(key)
 
     def _child_ready(self) -> None:
         if not self._ready_emitted:
@@ -85,6 +139,8 @@ class MultiController(QtCore.QObject):
                 ctrl.shutdown()
             except Exception:
                 pass
+        if key == "maia2":                     # checkers only run while Maia is on screen
+            self.refresh_checkers()
 
     # ----- request fan-out -----
     def request(self, board: chess.Board, multipv: int, mode: str, depth: int,
@@ -108,9 +164,15 @@ class MultiController(QtCore.QObject):
                 # strength so each engine shows its real opinion (limiter is a solo-mode aid).
                 ctrl.request(board, n, smode, depth, None, token, opp_live=False,
                              limit_strength=False, player_elo=player_elo, opp_elo=opp_elo)
+        # New position: drop any in-flight checks; they re-trigger when Maia next responds.
+        for c in self._checkers.values():
+            try:
+                c.clear()
+            except Exception:
+                pass
 
     def clear(self) -> None:
-        for c in list(self._children.values()):
+        for c in list(self._children.values()) + list(self._checkers.values()):
             try:
                 c.clear()
             except Exception:
@@ -124,14 +186,16 @@ class MultiController(QtCore.QObject):
                 pass
 
     def shutdown(self) -> None:
-        for c in list(self._children.values()):     # stop searching first…
+        everyone = list(self._children.values()) + list(self._checkers.values())
+        for c in everyone:                           # stop searching first…
             try:
                 c.clear()
             except Exception:
                 pass
-        for c in list(self._children.values()):     # …then join each worker/process
+        for c in everyone:                           # …then join each worker/process
             try:
                 c.shutdown()
             except Exception:
                 pass
         self._children.clear()
+        self._checkers.clear()

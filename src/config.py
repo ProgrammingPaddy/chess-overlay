@@ -53,6 +53,15 @@ class Config:
         "stockfish": True, "leela": True, "maia2": True})
     combined_lines: dict = field(default_factory=lambda: {
         "stockfish": 1, "leela": 1, "maia2": 3})
+    # Merge the per-engine values that land on the SAME square into one compact chip
+    # (instead of overprinting) so you can read every engine's eval + Maia's % at once.
+    combined_merge_labels: bool = False
+    # "Check Maia lines": evaluate each Maia candidate move with a strong engine (Stockfish
+    # and/or Leela), shown as extra colour-coded segments on the Maia arrows. Runs on
+    # SEPARATE checker instances, so it never disturbs the engines' own best-move evals.
+    combined_check_maia: bool = False
+    combined_check_with: dict = field(default_factory=lambda: {
+        "stockfish": True, "leela": False})
 
     # --- preferences (stable across sessions) ---
     board_monitor: int = 0
@@ -102,6 +111,7 @@ class Config:
     # Combined-mode engine keys and their default visibility / arrow counts.
     _COMBINED_DEFAULT_VISIBLE = {"stockfish": True, "leela": True, "maia2": True}
     _COMBINED_DEFAULT_LINES = {"stockfish": 1, "leela": 1, "maia2": 3}
+    _COMBINED_DEFAULT_CHECK_WITH = {"stockfish": True, "leela": False}
 
     @classmethod
     def load(cls) -> "Config":
@@ -124,6 +134,9 @@ class Config:
                                  for k, d in self._COMBINED_DEFAULT_VISIBLE.items()}
         self.combined_lines = {k: max(1, min(5, int(n.get(k, d))))
                                for k, d in self._COMBINED_DEFAULT_LINES.items()}
+        cw = self.combined_check_with if isinstance(self.combined_check_with, dict) else {}
+        self.combined_check_with = {k: bool(cw.get(k, d))
+                                    for k, d in self._COMBINED_DEFAULT_CHECK_WITH.items()}
 
     @staticmethod
     def _migrate(data: dict) -> None:

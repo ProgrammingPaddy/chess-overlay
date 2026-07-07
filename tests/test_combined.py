@@ -107,10 +107,11 @@ class StubChild(QtCore.QObject):
 
     def request(self, board, multipv, mode, depth, player_color=None, token=0,
                 opp_live=False, opp_depth=12, opp_max=22, limit_strength=False,
-                player_elo=1500, opp_elo=1500, puzzle=False, puzzle_side=None):
+                player_elo=1500, opp_elo=1500, puzzle=False, puzzle_side=None,
+                root_moves=None):
         self.reqs.append(dict(multipv=multipv, mode=mode, player_color=player_color,
                               token=token, player_elo=player_elo, opp_elo=opp_elo,
-                              limit=limit_strength))
+                              limit=limit_strength, root_moves=root_moves))
 
     def clear(self):
         pass
@@ -186,6 +187,94 @@ check("re-showing an engine respawns a fresh child",
 
 mc.shutdown()
 check("shutdown joins every child", all(ch.shut for ch in made.values()))
+
+
+# --- 4. losing-move red + merge + check segments (build_combined_annotations) --
+from src.overlay import RED
+yb = chess.Board()                                  # your turn (White to move)
+anns = build_combined_annotations([("stockfish", [sug("e2e4", cp=-90)], yb)], opponent_turn=False)
+check("a losing move on your turn is RED (overrides engine colour)", anns[0].color == RED)
+anns = build_combined_annotations([("stockfish", [sug("e2e4", cp=60)], yb)], opponent_turn=False)
+check("a good move keeps the engine colour", anns[0].color == ENGINE_COLORS["stockfish"])
+ob2 = chess.Board(); ob2.push_uci("e2e4")           # opponent (Black) to move
+anns = build_combined_annotations([("leela", [sug("e7e5", cp=50)], ob2)], opponent_turn=True)
+check("opponent moves are never red-overridden (stay engine colour, dashed)",
+      anns[0].color == ENGINE_COLORS["leela"] and anns[0].dashed)
+
+# merge: three engines on one square -> one chip carries all three coloured values
+per = [("stockfish", [sug("e2e4", cp=30)], yb), ("leela", [sug("e2e4", cp=25)], yb),
+       ("maia2", [sug("e2e4", policy=0.4)], yb)]
+anns = build_combined_annotations(per, opponent_turn=False, merge_labels=True)
+segged = [a for a in anns if a.segments]
+check("merge: exactly one arrow carries the combined chip", len(segged) == 1)
+check("merge: chip has all three values", segged and len(segged[0].segments) == 3,
+      str(segged[0].segments) if segged else None)
+check("merge: the other arrows are blanked",
+      sum(1 for a in anns if not a.segments and not a.label) == 2)
+
+# check: SF/Leela evals attach to the Maia arrow as extra segments
+per = [("maia2", [sug("g1f3", policy=0.5)], yb)]
+ce = {"g1f3": [("stockfish", "+0.20"), ("leela", "+0.10")]}
+anns = build_combined_annotations(per, opponent_turn=False, check_evals=ce)
+check("check: Maia arrow gets % + both engine evals",
+      anns[0].segments is not None and [s[0] for s in anns[0].segments] == ["50%", "+0.20", "+0.10"],
+      str(anns[0].segments))
+
+
+# --- 5. check-Maia fan-out (stub children + checkers) -------------------------
+cfg2 = Config()
+cfg2.engine = "combined"
+cfg2.combined_visible = {"stockfish": True, "leela": True, "maia2": True}
+cfg2.combined_check_maia = True
+cfg2.combined_check_with = {"stockfish": True, "leela": False}
+mc2 = me.MultiController(cfg2)
+checks = []
+mc2.check_updated.connect(lambda k, s, b, t: checks.append((k, s, t)))
+mc2.start()
+check("a checker spawns for the ticked engine when check is on", "stockfish" in mc2._checkers)
+check("no checker for an unticked engine", "leela" not in mc2._checkers)
+
+maia_child = mc2._children["maia2"]
+sf_checker = mc2._checkers["stockfish"]
+sf_checker.reqs.clear()
+maia_child.updated.emit([sug("e2e4", policy=0.4), sug("d2d4", policy=0.3)], 0, chess.Board(), [], 55)
+check("a Maia result triggers a root_moves check request",
+      sf_checker.reqs and sf_checker.reqs[-1]["root_moves"] is not None
+      and len(sf_checker.reqs[-1]["root_moves"]) == 2,
+      str(sf_checker.reqs[-1] if sf_checker.reqs else None))
+sf_checker.updated.emit([sug("e2e4", cp=30)], 12, chess.Board(), [], 55)
+check("the checker's result relays via check_updated tagged with the engine",
+      checks and checks[-1][0] == "stockfish" and checks[-1][2] == 55, str(checks[-1] if checks else None))
+mc2.set_visible("maia2", False)
+check("hiding Maia tears the checkers down (nothing to grade)", "stockfish" not in mc2._checkers)
+mc2.shutdown()
+
+# config: combined_check_with normalized like the others
+c2 = Config()
+c2.combined_check_with = {"leela": True}            # partial
+c2._normalize_combined()
+check("combined_check_with filled from defaults",
+      c2.combined_check_with == {"stockfish": True, "leela": True}, str(c2.combined_check_with))
+
+
+# --- 6. root_moves targeted eval (real Stockfish; skipped if absent) ----------
+from src.analysis import EngineController
+from src.engine import find_stockfish
+_sf = find_stockfish()
+if not _sf:
+    print("  SKIP  no Stockfish — root_moves eval test skipped")
+else:
+    import chess.engine
+    cc = EngineController(_sf, 1, 64)
+    cc._engine = chess.engine.SimpleEngine.popen_uci(_sf)
+    cc._engine.configure({"Threads": 1, "Hash": 64})
+    moves = [chess.Move.from_uci(u) for u in ("e2e4", "g1f3", "a2a3")]
+    out = cc._analyse_blocking(chess.Board(), len(moves), 12, root_moves=moves)
+    got = {s.move.uci() for s in out}
+    check("root_moves eval scores exactly the requested moves",
+          got == {"e2e4", "g1f3", "a2a3"}, str(got))
+    check("each checked move carries an eval", all(s.score_cp is not None for s in out))
+    cc._engine.quit()
 
 print(f"\n{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)

@@ -178,6 +178,10 @@ class Annotation:
     color: tuple | None = None
     dashed: bool = False
     ring: float = 1.0
+    # Combined mode: several colour-coded values on one square (each engine's eval, plus
+    # Maia's % and any 'check' evals). A list of (text, rgb); when set it REPLACES ``label``
+    # and is drawn as one compact chip so the values don't overprint (see _draw_segments).
+    segments: list | None = None
 
 
 def _styled_set_policy(suggestions, opponent: bool, flip: bool, gold: bool,
@@ -313,16 +317,32 @@ def _combine_same_square_labels(anns: list["Annotation"]) -> None:
                 a.label = ""
 
 
-def build_combined_annotations(per_engine, opponent_turn: bool) -> list["Annotation"]:
+def _suggestion_losing(s) -> bool:
+    """Is the move bad for the side to move (mover-POV eval below zero)? Used to flag a
+    losing candidate red even in combined mode, where colour normally means the engine."""
+    if s.mate_in is not None:
+        return s.mate_in < 0
+    return s.score_cp is not None and s.score_cp < 0
+
+
+def build_combined_annotations(per_engine, opponent_turn: bool, merge_labels: bool = False,
+                               check_evals: dict | None = None) -> list["Annotation"]:
     """Overlay several engines' picks at once, each in its OWN colour (see ENGINE_COLORS).
 
     ``per_engine`` is a list of ``(engine_key, suggestions, board)`` — each engine's top
     move(s) for the side to move on ``board``. All engines analyse the SAME position, so
     every arrow is legal on the live board. On your turn the arrows are SOLID; on the
     opponent's turn they are DASHED — that dashed set is each engine's 'opponent eval'.
-    Lower-ranked moves within one engine fade; the eval (or human %) rides along as the
-    label, tinted to the engine's colour."""
+    Lower-ranked moves within one engine fade; the eval (or human %) rides along as the label.
+
+    A LOSING candidate on your turn (mover-POV eval < 0) is drawn RED — overriding the engine
+    colour — so a bad suggestion reads as bad, exactly like single-engine mode. ``check_evals``
+    (``{move_uci: [(engine_key, text), …]}``) adds strong-engine evals of the Maia moves as
+    extra colour-coded label segments. With ``merge_labels`` the per-engine values on a SHARED
+    square are combined into one compact multi-colour chip instead of overprinting."""
+    check_evals = check_evals or {}
     anns: list[Annotation] = []
+    records = []                                   # (ann, own_segment, engine_key, move_uci)
     for key, suggestions, board in per_engine:
         if not suggestions:
             continue
@@ -342,11 +362,39 @@ def build_combined_annotations(per_engine, opponent_turn: bool) -> list["Annotat
             else:
                 label = s.eval_text_pov(flip)
                 strength = strengths[i] if i < len(strengths) else 1.0
-            anns.append(Annotation(
+            # A losing move on YOUR turn is red (bad), overriding the engine colour; the
+            # opponent's dashed predictions keep their engine colour.
+            arrow_col = RED if (not opponent_turn and _suggestion_losing(s)) else col
+            ann = Annotation(
                 move=s.move, rank=s.rank, label=label, opponent=False,
                 score_cp=abs_cp, mate=abs_mate, strength=strength,
                 player_is_white=(board.turn == chess.WHITE),
-                color=col, dashed=opponent_turn, ring=ring))
+                color=arrow_col, dashed=opponent_turn, ring=ring)
+            anns.append(ann)
+            records.append((ann, (label, col), key, s.move.uci()))
+
+    # Check evals: attach each strong engine's eval of a Maia move as extra segments.
+    for ann, seg, key, uci in records:
+        if key == "maia2" and uci in check_evals:
+            ann.segments = [seg] + [(text, ENGINE_COLORS.get(eng))
+                                    for eng, text in check_evals[uci]]
+
+    # Merge: combine the per-engine values that land on the SAME square into one chip.
+    if merge_labels:
+        from collections import defaultdict
+        groups: dict = defaultdict(list)
+        for rec in records:
+            groups[rec[0].move.to_square].append(rec)
+        for group in groups.values():
+            if len(group) <= 1:
+                continue
+            combined = []
+            for ann, seg, key, uci in group:
+                combined += ann.segments if ann.segments else [seg]
+            group[0][0].segments = combined
+            for ann, *_ in group[1:]:              # blank the rest so nothing overprints
+                ann.label = ""
+                ann.segments = None
     return anns
 
 
@@ -517,7 +565,9 @@ class _OverlayWindow(QtWidgets.QWidget):
         painter.drawEllipse(dst, radius, radius)      # circle the destination
 
         self._draw_arrow(painter, src, dst, color, g.square, dashed=ann.dashed)
-        if ann.label:
+        if ann.segments:
+            self._draw_segments(painter, dst, ann.segments, g.square)
+        elif ann.label:
             self._draw_label(painter, dst, ann.label, _eval_text_color(ann), g.square)
 
     @staticmethod
@@ -550,6 +600,39 @@ class _OverlayWindow(QtWidgets.QWidget):
         painter.setPen(QtCore.Qt.NoPen)
         painter.setBrush(color)
         painter.drawPath(path)
+
+    @staticmethod
+    def _draw_segments(painter: QtGui.QPainter, at: QtCore.QPointF, segments: list,
+                       square: float) -> None:
+        """Several colour-coded values on one square, laid out as ONE compact horizontal
+        chip (each value in its engine's colour) so they never overprint and the piece stays
+        visible below. Used for merged per-engine evals and Maia + check evals."""
+        segs = [(str(t), c) for t, c in segments if str(t)]
+        if not segs:
+            return
+        font = painter.font()
+        font.setPixelSize(max(10, int(square * 0.19)))
+        font.setBold(True)
+        painter.setFont(font)
+        fm = QtGui.QFontMetrics(font)
+        gap = max(4, int(square * 0.10))
+        widths = [fm.horizontalAdvance(t) for t, _ in segs]
+        total = sum(widths) + gap * (len(segs) - 1)
+        padx = max(4, int(square * 0.08))
+        h = fm.height() + 2
+        y0 = at.y() - square * 0.5                  # top edge of the square -> piece visible below
+        x0 = at.x() - total / 2.0
+        box = QtCore.QRectF(x0 - padx, y0, total + 2 * padx, h)
+        painter.setPen(QtCore.Qt.NoPen)
+        painter.setBrush(QtGui.QColor(15, 15, 15, 210))   # dark chip so any colour reads
+        painter.drawRoundedRect(box, 4, 4)
+        baseline = y0 + fm.ascent() + 1
+        x = x0
+        for (t, c), w in zip(segs, widths):
+            r, g, b = c if c else (235, 235, 235)
+            painter.setPen(QtGui.QPen(QtGui.QColor(min(255, r + 45), min(255, g + 45), min(255, b + 45))))
+            painter.drawText(QtCore.QPointF(x, baseline), t)
+            x += w + gap
 
     @staticmethod
     def _draw_label(painter: QtGui.QPainter, at: QtCore.QPointF, text: str,
